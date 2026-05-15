@@ -1,0 +1,12 @@
+{
+  "id": "claude-agent-sdk",
+  "name": "Claude Agent SDK Backend",
+  "description": "Replaces the claude CLI subprocess with the Anthropic Agent SDK for richer status events and stable multi-turn streaming",
+  "cliBackends": ["claude-agent-sdk"],
+  "setup": {
+    "cliBackends": ["claude-agent-sdk"],
+    "requiresRuntime": false
+  },
+  "activation": { "onStartup": true },
+  "configSchema": { "type": "object", "additionalProperties": false }
+}

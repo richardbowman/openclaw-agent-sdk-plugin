@@ -1,0 +1,6 @@
+node_modules
+.git
+docker-qa.sh
+docker-test.sh
+test-harness.mjs
+Dockerfile

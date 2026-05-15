@@ -1,0 +1,24 @@
+{
+  "name": "openclaw-agent-sdk-plugin",
+  "version": "2.0.0",
+  "description": "OpenClaw CliBackendPlugin that drives Claude Code via the Anthropic Agent SDK, enabling richer status events and stable multi-turn streaming.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "openclaw": {
+    "extensions": ["./index.mjs"]
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.5.12"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.142",
+    "zod": "^4.0.0"
+  }
+}

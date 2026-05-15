@@ -1,0 +1,16 @@
+{
+  "_comment": [
+    "The only openclaw.json change needed after installing the plugin.",
+    "Set agents.defaults.model to the new backend ID + model name.",
+    "The backend ID is 'claude-agent-sdk' (registered by index.mjs).",
+    "Replace 'claude-sonnet-4-6' with whichever model you have access to.",
+    "",
+    "There is no longer a cliBackends override required — the plugin declares",
+    "command, args, resumeArgs, and all CliBackendConfig fields itself."
+  ],
+  "agents": {
+    "defaults": {
+      "model": "claude-agent-sdk/claude-sonnet-4-6"
+    }
+  }
+}
