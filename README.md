@@ -12,7 +12,7 @@ the Agent SDK and streams JSONL back.
 - Richer status events: `tool_use_start`, `tool_use_end`, and `session_start` alongside the standard stream
 - Node.js-level error handling instead of shell watchdog restarts
 - Native multi-turn streaming via the SDK's async-generator protocol
-- Clean arg assembly via OpenClaw's `CliBackendConfig` — no manual CLI flag lists in `openclaw.json`
+- Clean arg assembly via OpenClaw's `CliBackendConfig` - no manual CLI flag lists in `openclaw.json`
 
 **What stays the same:**
 
@@ -66,7 +66,7 @@ the Agent SDK and streams JSONL back.
 └─────────────────────────────────────────────────┘
 ```
 
-### index.mjs — the plugin entry point
+### index.mjs - the plugin entry point
 
 Loaded by OpenClaw at startup via the `"openclaw": { "extensions": ["./index.mjs"] }`
 key in `package.json`. It calls `api.registerCliBackend()` with a full
@@ -92,7 +92,7 @@ Two hooks are also declared on the backend object:
 - `resolveExecutionArgs`: called per turn. Maps the OpenClaw `thinkingLevel` setting
   to an `--effort` value and appends it to the args for that turn.
 
-### proxy.mjs — the subprocess
+### proxy.mjs - the subprocess
 
 Spawned by OpenClaw for each session (kept alive in live-session mode). It:
 
@@ -334,27 +334,27 @@ The `Dockerfile` builds a `debian:bookworm-slim` image with Node.js 22 (via
 NodeSource), the `claude` CLI, OpenClaw, and the plugin files. All three test
 scripts build this image automatically.
 
-### docker-qa.sh — integration and config checks
+### docker-qa.sh - integration and config checks
 
 Runs six checks inside a single container, none of which require real API calls:
 
-1. `openclaw plugins install /config/claude-sdk-proxy/` — verifies the plugin
+1. `openclaw plugins install /config/claude-sdk-proxy/` - verifies the plugin
    installs without errors
-2. `import openclaw/plugin-sdk/plugin-entry` — verifies the OpenClaw peer
+2. `import openclaw/plugin-sdk/plugin-entry` - verifies the OpenClaw peer
    dependency is loadable from Node
-3. `tools.exec` key names — greps the compiled OpenClaw source to confirm the
+3. `tools.exec` key names - greps the compiled OpenClaw source to confirm the
    `context.config.tools.exec.security` and `.ask` field paths used in
    `normalizeConfig`
-4. `normalizeConfig` context shape — greps `normalizeClaudeBackendConfig` from the
+4. `normalizeConfig` context shape - greps `normalizeClaudeBackendConfig` from the
    built-in backend for comparison
-5. Valid model IDs — greps the compiled constants for the model allowlist
-6. `openclaw plugins list` — confirms `claude-agent-sdk` appears after install
+5. Valid model IDs - greps the compiled constants for the model allowlist
+6. `openclaw plugins list` - confirms `claude-agent-sdk` appears after install
 
 ```bash
 ./docker-qa.sh
 ```
 
-### docker-test.sh — proxy integration tests (real API calls)
+### docker-test.sh - proxy integration tests (real API calls)
 
 Extracts the OAuth token from the macOS keychain, builds the image, and runs
 `test-harness.mjs` inside the container. The harness spawns `proxy.mjs` as a
@@ -371,7 +371,7 @@ subprocess and verifies its JSONL output for six test cases:
 ./docker-test.sh
 ```
 
-### docker-e2e.sh — full gateway end-to-end test
+### docker-e2e.sh - full gateway end-to-end test
 
 The most complete test. Builds the image, starts the OpenClaw gateway inside a
 container, installs the plugin, sets the model to `claude-agent-sdk/claude-sonnet-4-6`,
