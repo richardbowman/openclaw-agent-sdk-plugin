@@ -86,9 +86,9 @@ key in `package.json`. It calls `api.registerCliBackend()` with a full
 Two hooks are also declared on the backend object:
 
 - `normalizeConfig`: called once per session start. Reads `context.config.tools.exec`
-  (the already-resolved permission settings from `openclaw.json`) and appends
-  `--permission-mode bypassPermissions` or `--permission-mode acceptEdits` to `args`
-  as appropriate.
+  (the already-resolved permission settings from `openclaw.json`) and upgrades
+  `--permission-mode` from `acceptEdits` (the default in `args`) to `bypassPermissions`
+  when YOLO mode is active.
 - `resolveExecutionArgs`: called per turn. Maps the OpenClaw `thinkingLevel` setting
   to an `--effort` value and appends it to the args for that turn.
 
@@ -221,13 +221,12 @@ into the subprocess args automatically via the `modelArg` declaration.
 ### Permission modes
 
 Controlled by `tools.exec` in `openclaw.json`, same as the built-in backend.
-The `normalizeConfig` hook maps these to `--permission-mode` flags:
+`acceptEdits` is injected by default in all sessions. `normalizeConfig` upgrades it to `bypassPermissions` only when OpenClaw's YOLO mode is active (`tools.exec.security: "full"` and `tools.exec.ask: "off"`).
 
-| `tools.exec.security` | `tools.exec.ask` | Resulting flag |
+| `tools.exec.security` | `tools.exec.ask` | Resulting `--permission-mode` |
 |---|---|---|
-| `"full"` | `"off"` | `--permission-mode bypassPermissions` |
-| `"edits"` | any | `--permission-mode acceptEdits` |
-| anything else | any | (no flag; claude handles permission prompting itself) |
+| `"full"` | `"off"` | `bypassPermissions` |
+| anything else | any | `acceptEdits` (default, always injected) |
 
 ### Thinking levels and effort
 

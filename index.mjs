@@ -75,12 +75,14 @@ function buildBackend() {
       args: [
         "/config/claude-sdk-proxy/proxy.mjs",
         "--allowed-tools", "mcp__openclaw__*",
+        "--permission-mode", "acceptEdits",
       ],
 
       // Resume args. Same as args plus the session ID substitution token.
       resumeArgs: [
         "/config/claude-sdk-proxy/proxy.mjs",
         "--allowed-tools", "mcp__openclaw__*",
+        "--permission-mode", "acceptEdits",
         "--resume", "{sessionId}",
       ],
 
@@ -109,9 +111,13 @@ function buildBackend() {
     },
 
     /**
-     * Inject --permission-mode into args based on the OpenClaw tools.exec
-     * security config.  Called once per session start before OpenClaw builds
-     * the subprocess command line.
+     * Override --permission-mode when OpenClaw YOLO mode is active.
+     * Called once per session start before OpenClaw builds the subprocess
+     * command line.
+     *
+     * acceptEdits is already in the base args above and applies to all
+     * sessions by default.  This hook only upgrades to bypassPermissions
+     * for YOLO mode.
      *
      * Field names verified against OpenClaw source (cli-shared.ts
      * isOpenClawRequestedYolo): context.config.tools.exec.security and
@@ -119,22 +125,19 @@ function buildBackend() {
      * live at context.config.agents.list[agentId].tools.exec — OpenClaw
      * handles that lookup itself before calling normalizeConfig, so we read
      * the already-resolved top-level tools.exec here.
-     *
-     * Logic mirrors OpenClaw's built-in anthropic extension:
-     *   tools.exec.security === "full" && tools.exec.ask === "off"
-     *     -> bypassPermissions  (user opted into full trust, no prompts)
-     *   tools.exec.security === "edits"
-     *     -> acceptEdits  (allow file edits, prompt for exec/shell)
-     *   anything else
-     *     -> omit flag  (claude handles permission prompting itself)
      */
     normalizeConfig(config, context) {
+      // Override to bypassPermissions if OpenClaw YOLO mode is active.
+      // Verified against OpenClaw source (isOpenClawRequestedYolo in cli-shared):
+      //   tools.exec.security === "full" && tools.exec.ask === "off"
+      // In all other cases acceptEdits is already in the base args above.
       const args = [...(config.args ?? [])];
       const exec = context?.config?.tools?.exec;
       if (exec?.security === "full" && exec?.ask === "off") {
-        args.push("--permission-mode", "bypassPermissions");
-      } else if (exec?.security === "edits") {
-        args.push("--permission-mode", "acceptEdits");
+        // Replace acceptEdits with bypassPermissions
+        const idx = args.indexOf("acceptEdits");
+        if (idx !== -1) args[idx] = "bypassPermissions";
+        else args.push("--permission-mode", "bypassPermissions");
       }
       return { ...config, args };
     },
