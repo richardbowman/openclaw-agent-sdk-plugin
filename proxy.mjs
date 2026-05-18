@@ -42,6 +42,7 @@
 import { query }            from "@anthropic-ai/claude-agent-sdk";
 import { createInterface }  from "readline";
 import { readFile }         from "fs/promises";
+import { appendFileSync }   from "fs";
 
 // ─── CLI arg parsing ──────────────────────────────────────────────────────────
 
@@ -96,11 +97,17 @@ for (let i = 0; i < argv.length; i++) {
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
 
-/** Write a timestamped diagnostic line to stderr. Never throws. */
+// OpenClaw doesn't forward subprocess stderr to its supervisor log, so we
+// write to a file that can be tailed directly on the HA instance:
+//   ssh root@rhome.local "tail -f /addon_configs/17e0cc66_openclaw_assistant/claude-sdk-proxy/proxy.log"
+const LOG_FILE = "/config/claude-sdk-proxy/proxy.log";
+
+/** Write a timestamped diagnostic line to stderr and the log file. Never throws. */
 function log(msg) {
   try {
-    const ts = new Date().toISOString();
-    process.stderr.write(`[claude-agent-sdk-proxy] ${ts} ${msg}\n`);
+    const line = `[claude-agent-sdk-proxy] ${new Date().toISOString()} ${msg}\n`;
+    process.stderr.write(line);
+    appendFileSync(LOG_FILE, line);
   } catch { /* ignore write errors */ }
 }
 
