@@ -94,6 +94,16 @@ for (let i = 0; i < argv.length; i++) {
   }
 }
 
+// ─── Logging ──────────────────────────────────────────────────────────────────
+
+/** Write a timestamped diagnostic line to stderr. Never throws. */
+function log(msg) {
+  try {
+    const ts = new Date().toISOString();
+    process.stderr.write(`[claude-agent-sdk-proxy] ${ts} ${msg}\n`);
+  } catch { /* ignore write errors */ }
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /** Safely read a file, returning undefined on any error. */
@@ -101,7 +111,8 @@ async function tryReadFile(path) {
   if (!path) return undefined;
   try {
     return (await readFile(path, "utf8")).trim();
-  } catch {
+  } catch (err) {
+    log(`WARN tryReadFile("${path}"): ${err?.message ?? String(err)}`);
     return undefined;
   }
 }
@@ -116,7 +127,8 @@ async function tryReadMcpConfig(path) {
   try {
     const raw = JSON.parse(await readFile(path, "utf8"));
     return raw.mcpServers ?? raw;
-  } catch {
+  } catch (err) {
+    log(`WARN tryReadMcpConfig("${path}"): ${err?.message ?? String(err)}`);
     return undefined;
   }
 }
@@ -163,28 +175,93 @@ async function readAllStdin() {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
+  // Startup banner — visible in OpenClaw's CLI backend log on every turn.
+  log(
+    `starting: mode=${isLiveSession ? "live-session" : "per-turn"}` +
+    ` model=${model ?? "(default)"}` +
+    ` permissionMode=${permissionMode ?? "(default)"}` +
+    ` effort=${effort ?? "(default)"}` +
+    ` resume=${resumeId ?? "none"}`,
+  );
+
   // Kick off file reads in parallel before we start consuming stdin.
   const [mcpServers, appendSystemPrompt] = await Promise.all([
     tryReadMcpConfig(mcpConfigFile),
     tryReadFile(syspromptFile),
   ]);
 
-  // Re-inject the OAuth token if a token file is present.
+  // Re-inject the OAuth token so the claude subprocess spawned by the Agent
+  // SDK can authenticate.
   //
-  // OpenClaw's CLEAR_ENV list strips CLAUDE_CODE_OAUTH_TOKEN before spawning
-  // this process, so process.env has no auth credentials.  The Agent SDK
-  // passes env: {...process.env} to the claude subprocess it spawns, which
-  // means the subprocess also has no token and returns "Not logged in".
+  // OpenClaw's CLEAR_ENV list strips CLAUDE_CODE_OAUTH_TOKEN (and
+  // CLAUDE_CODE_OAUTH_REFRESH_TOKEN) before spawning this process, so
+  // process.env has no auth credentials.  The Agent SDK passes
+  // env: {...process.env} to the claude subprocess it spawns, which means
+  // the subprocess also has no token and returns "Not logged in".
   //
-  // The token file path is a well-known mount point set by docker-e2e.sh
-  // (and should be set the same way in production HA installs).  If the file
-  // is absent we leave process.env untouched; OpenClaw's own credential
-  // management handles auth in normal operation.
-  const TOKEN_FILE_PATH = "/run/claude-auth/oauth_token";
-  const oauthTokenFromFile = await tryReadFile(TOKEN_FILE_PATH);
-  const subprocessEnv = oauthTokenFromFile
-    ? { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: oauthTokenFromFile }
-    : { ...process.env };
+  // We try two sources in order:
+  //   1. /run/claude-auth/oauth_token  — well-known mount point used in
+  //      docker-e2e.sh; takes precedence so docker tests still work.
+  //   2. /config/.claude/.credentials.json — where OpenClaw stores the
+  //      Claude OAuth credentials on Home Assistant.  We read accessToken,
+  //      refreshToken, and expiresAt so the claude subprocess can
+  //      auto-refresh an expired access token without needing a gateway
+  //      restart.
+  const TOKEN_FILE_PATH     = "/run/claude-auth/oauth_token";
+  const HA_CREDENTIALS_PATH = "/config/.claude/.credentials.json";
+
+  let oauthToken    = undefined;
+  let refreshToken  = undefined;
+  let tokenSource   = "none";
+
+  const dockerToken = await tryReadFile(TOKEN_FILE_PATH);
+  if (dockerToken) {
+    oauthToken  = dockerToken;
+    tokenSource = "docker-mount";
+  } else {
+    try {
+      const raw   = JSON.parse(await readFile(HA_CREDENTIALS_PATH, "utf8"));
+      const creds = raw?.claudeAiOauth;
+      if (creds?.accessToken) {
+        oauthToken   = creds.accessToken;
+        refreshToken = creds.refreshToken ?? undefined;
+        tokenSource  = "ha-credentials";
+
+        // Warn if the access token is expired or expiring soon.
+        if (creds.expiresAt) {
+          const msLeft = creds.expiresAt - Date.now();
+          if (msLeft <= 0) {
+            log(`WARN auth: access token EXPIRED ${Math.round(-msLeft / 60000)} min ago — claude will need to refresh`);
+          } else if (msLeft < 10 * 60 * 1000) {
+            log(`WARN auth: access token expires in ${Math.round(msLeft / 60000)} min`);
+          }
+        }
+
+        if (!refreshToken) {
+          log(`WARN auth: no refreshToken in credentials — cannot auto-refresh after expiry`);
+        }
+      } else {
+        log(`WARN ha-credentials file parsed but claudeAiOauth.accessToken is missing or empty`);
+      }
+    } catch (err) {
+      log(`WARN ha-credentials read failed ("${HA_CREDENTIALS_PATH}"): ${err?.message ?? String(err)}`);
+    }
+  }
+
+  if (oauthToken) {
+    log(`auth: token found via ${tokenSource} (length=${oauthToken.length})${refreshToken ? ", refreshToken present" : ""}`);
+  } else {
+    log(`WARN auth: no OAuth token found from any source — claude subprocess will likely fail to authenticate`);
+  }
+
+  // Inject both tokens into the subprocess env.  When the access token is
+  // expired, the claude binary uses the refresh token to obtain a new one
+  // and updates credentials.json automatically.
+  const subprocessEnv = {
+    ...process.env,
+    ...(oauthToken   && { CLAUDE_CODE_OAUTH_TOKEN:         oauthToken }),
+    ...(refreshToken && { CLAUDE_CODE_OAUTH_REFRESH_TOKEN: refreshToken }),
+  };
 
   const options = {
     // Use the system `claude` binary that OpenClaw already installed.
@@ -275,13 +352,13 @@ async function main() {
       });
     }
   }
+
+  log("done");
 }
 
 main().catch((err) => {
   // Write errors to stderr so they appear in OpenClaw's CLI backend log,
   // not in the JSONL stream that OpenClaw is parsing.
-  process.stderr.write(
-    `[claude-agent-sdk-proxy] ${err?.stack ?? err?.message ?? String(err)}\n`,
-  );
+  log(`ERROR ${err?.stack ?? err?.message ?? String(err)}`);
   process.exit(1);
 });
