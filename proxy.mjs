@@ -219,6 +219,7 @@ async function main() {
 
   let oauthToken    = undefined;
   let refreshToken  = undefined;
+  let tokenExpired  = false;
   let tokenSource   = "none";
 
   const dockerToken = await tryReadFile(TOKEN_FILE_PATH);
@@ -234,11 +235,12 @@ async function main() {
         refreshToken = creds.refreshToken ?? undefined;
         tokenSource  = "ha-credentials";
 
-        // Warn if the access token is expired or expiring soon.
+        // Check expiry and flag for the env-building logic below.
         if (creds.expiresAt) {
           const msLeft = creds.expiresAt - Date.now();
           if (msLeft <= 0) {
-            log(`WARN auth: access token EXPIRED ${Math.round(-msLeft / 60000)} min ago — claude will need to refresh`);
+            tokenExpired = true;
+            log(`WARN auth: access token EXPIRED ${Math.round(-msLeft / 60000)} min ago — will use config-dir auth so claude can refresh`);
           } else if (msLeft < 10 * 60 * 1000) {
             log(`WARN auth: access token expires in ${Math.round(msLeft / 60000)} min`);
           }
@@ -256,18 +258,27 @@ async function main() {
   }
 
   if (oauthToken) {
-    log(`auth: token found via ${tokenSource} (length=${oauthToken.length})${refreshToken ? ", refreshToken present" : ""}`);
+    log(`auth: token found via ${tokenSource} (length=${oauthToken.length})${refreshToken ? ", refreshToken present" : ""}${tokenExpired ? " [EXPIRED — falling back to config-dir auth]" : ""}`);
   } else {
     log(`WARN auth: no OAuth token found from any source — claude subprocess will likely fail to authenticate`);
   }
 
-  // Inject both tokens into the subprocess env.  When the access token is
-  // expired, the claude binary uses the refresh token to obtain a new one
-  // and updates credentials.json automatically.
+  // Build subprocess env.
+  //
+  // When the access token is valid: inject it directly so the subprocess
+  // doesn't need to touch disk at all.
+  //
+  // When the access token is EXPIRED: do NOT inject it — passing a stale
+  // CLAUDE_CODE_OAUTH_TOKEN causes a hard 401 even when CLAUDE_CODE_OAUTH_REFRESH_TOKEN
+  // is also present (the claude binary does not auto-refresh in that path).
+  // Instead, point CLAUDE_CONFIG_DIR at the credentials file so the claude
+  // binary reads the refresh token from disk and handles the OAuth refresh
+  // flow itself.
   const subprocessEnv = {
     ...process.env,
-    ...(oauthToken   && { CLAUDE_CODE_OAUTH_TOKEN:         oauthToken }),
-    ...(refreshToken && { CLAUDE_CODE_OAUTH_REFRESH_TOKEN: refreshToken }),
+    ...(!tokenExpired && oauthToken   && { CLAUDE_CODE_OAUTH_TOKEN:         oauthToken }),
+    ...(!tokenExpired && refreshToken && { CLAUDE_CODE_OAUTH_REFRESH_TOKEN: refreshToken }),
+    ...(tokenExpired                  && { CLAUDE_CONFIG_DIR: "/config/.claude" }),
   };
 
   const options = {
