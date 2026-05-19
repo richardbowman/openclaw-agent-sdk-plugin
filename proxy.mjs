@@ -301,6 +301,29 @@ async function main() {
     log(`WARN bundled claude binary not found, falling back to PATH`);
   }
 
+  // Pre-flight: run claude --version to surface startup errors before the SDK
+  // swallows them. Logs stdout+stderr so we can see exactly what fails.
+  {
+    const { spawn } = await import("child_process");
+    await new Promise((resolve) => {
+      const probe = spawn(resolvedClaudePath, ["--version"], {
+        env: subprocessEnv,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let out = "", err = "";
+      probe.stdout.on("data", (d) => { out += d; });
+      probe.stderr.on("data", (d) => { err += d; });
+      probe.on("close", (code) => {
+        log(`INFO claude --version exit=${code} stdout=${out.trim()} stderr=${err.trim()}`);
+        resolve();
+      });
+      probe.on("error", (e) => {
+        log(`WARN claude --version spawn error: ${e.message}`);
+        resolve();
+      });
+    });
+  }
+
   const options = {
     pathToClaudeCodeExecutable: resolvedClaudePath,
 
