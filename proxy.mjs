@@ -281,9 +281,28 @@ async function main() {
     ...(tokenExpired                  && { CLAUDE_CONFIG_DIR: "/config/.claude" }),
   };
 
+  // Prefer the claude binary bundled in our own node_modules by the
+  // @anthropic-ai/claude-agent-sdk-linux-x64 optional dependency. This
+  // avoids depending on PATH, which may resolve to an older/incompatible
+  // system binary if the openclaw npm package is absent from
+  // /config/.node_global. Fall back to "claude" (PATH) only if the
+  // bundled binary is somehow missing.
+  const __proxyDir = new URL(".", import.meta.url).pathname;
+  const bundledClaudePath =
+    `${__proxyDir}node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude`;
+  let resolvedClaudePath;
+  try {
+    const { statSync } = await import("fs");
+    statSync(bundledClaudePath);
+    resolvedClaudePath = bundledClaudePath;
+    log(`INFO using bundled claude binary: ${bundledClaudePath}`);
+  } catch {
+    resolvedClaudePath = "claude";
+    log(`WARN bundled claude binary not found, falling back to PATH`);
+  }
+
   const options = {
-    // Use the system `claude` binary that OpenClaw already installed.
-    pathToClaudeCodeExecutable: "claude",
+    pathToClaudeCodeExecutable: resolvedClaudePath,
 
     allowedTools,
     settingSources: ["user"],
