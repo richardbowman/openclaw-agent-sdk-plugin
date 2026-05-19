@@ -301,26 +301,6 @@ async function main() {
     log(`WARN bundled claude binary not found, falling back to PATH`);
   }
 
-  // Pre-flight: run claude --version to surface startup errors before the SDK
-  // swallows them. Logs stdout+stderr so we can see exactly what fails.
-  log(`DEBUG pre-flight: about to import child_process`);
-  {
-    const { spawn, execFileSync } = await import("child_process");
-    log(`DEBUG pre-flight: child_process imported, spawning: ${resolvedClaudePath}`);
-    // Also try a synchronous exec to ensure we capture output even if async doesn't complete
-    try {
-      const syncOut = execFileSync(resolvedClaudePath, ["--version"], {
-        env: subprocessEnv,
-        timeout: 5000,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      log(`DEBUG claude --version sync stdout: ${syncOut.trim()}`);
-    } catch (syncErr) {
-      log(`DEBUG claude --version sync error: code=${syncErr.status} stdout=${String(syncErr.stdout ?? "").trim()} stderr=${String(syncErr.stderr ?? "").trim()} msg=${syncErr.message}`);
-    }
-  }
-
   const options = {
     pathToClaudeCodeExecutable: resolvedClaudePath,
 
