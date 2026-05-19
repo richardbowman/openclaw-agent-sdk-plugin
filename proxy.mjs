@@ -303,25 +303,22 @@ async function main() {
 
   // Pre-flight: run claude --version to surface startup errors before the SDK
   // swallows them. Logs stdout+stderr so we can see exactly what fails.
+  log(`DEBUG pre-flight: about to import child_process`);
   {
-    const { spawn } = await import("child_process");
-    await new Promise((resolve) => {
-      const probe = spawn(resolvedClaudePath, ["--version"], {
+    const { spawn, execFileSync } = await import("child_process");
+    log(`DEBUG pre-flight: child_process imported, spawning: ${resolvedClaudePath}`);
+    // Also try a synchronous exec to ensure we capture output even if async doesn't complete
+    try {
+      const syncOut = execFileSync(resolvedClaudePath, ["--version"], {
         env: subprocessEnv,
+        timeout: 5000,
+        encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
       });
-      let out = "", err = "";
-      probe.stdout.on("data", (d) => { out += d; });
-      probe.stderr.on("data", (d) => { err += d; });
-      probe.on("close", (code) => {
-        log(`INFO claude --version exit=${code} stdout=${out.trim()} stderr=${err.trim()}`);
-        resolve();
-      });
-      probe.on("error", (e) => {
-        log(`WARN claude --version spawn error: ${e.message}`);
-        resolve();
-      });
-    });
+      log(`DEBUG claude --version sync stdout: ${syncOut.trim()}`);
+    } catch (syncErr) {
+      log(`DEBUG claude --version sync error: code=${syncErr.status} stdout=${String(syncErr.stdout ?? "").trim()} stderr=${String(syncErr.stderr ?? "").trim()} msg=${syncErr.message}`);
+    }
   }
 
   const options = {
