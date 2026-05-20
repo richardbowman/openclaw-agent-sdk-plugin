@@ -41,7 +41,7 @@
 
 import { query }            from "@anthropic-ai/claude-agent-sdk";
 import { createInterface }  from "readline";
-import { readFile }         from "fs/promises";
+import { readFile, writeFile, rename } from "fs/promises";
 import { appendFileSync }   from "fs";
 
 // ─── CLI arg parsing ──────────────────────────────────────────────────────────
@@ -145,6 +145,74 @@ function emit(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");
 }
 
+// ─── Session prune ────────────────────────────────────────────────────────────
+
+const SESSIONS_FILE  = "/config/.openclaw/agents/main/sessions/sessions.json";
+const PRUNE_STAMP    = "/config/claude-sdk-proxy/last-prune.txt";
+const PRUNE_INTERVAL = 12 * 60 * 60 * 1000; // 12 hours
+
+/**
+ * Prune stale "agent:main:openai:<uuid>" entries from OpenClaw's sessions
+ * file.  Runs at most once every 12 hours (guarded by a stamp file).  Writes
+ * back atomically via a .tmp rename so OpenClaw never sees a torn file.
+ *
+ * Called fire-and-forget at the start of each turn — never delays a request.
+ */
+async function pruneOldApiSessions() {
+  try {
+    // Throttle: skip if pruned recently.
+    try {
+      const stamp = await readFile(PRUNE_STAMP, "utf8");
+      const last  = Number(stamp.trim());
+      if (!Number.isNaN(last) && Date.now() - last < PRUNE_INTERVAL) return;
+    } catch { /* stamp absent → first run */ }
+
+    // Read and parse.
+    let sessions;
+    try {
+      sessions = JSON.parse(await readFile(SESSIONS_FILE, "utf8"));
+    } catch (err) {
+      log(`WARN prune: could not read sessions file: ${err?.message ?? String(err)}`);
+      return;
+    }
+    if (typeof sessions !== "object" || sessions === null || Array.isArray(sessions)) {
+      log("WARN prune: sessions file root is not a plain object — skipping");
+      return;
+    }
+
+    // Delete all openai per-turn keys.
+    const PREFIX = "agent:main:openai:";
+    let removed = 0;
+    for (const key of Object.keys(sessions)) {
+      if (key.startsWith(PREFIX)) { delete sessions[key]; removed++; }
+    }
+
+    // Write back atomically.
+    if (removed > 0) {
+      const tmp = SESSIONS_FILE + ".tmp";
+      try {
+        await writeFile(tmp, JSON.stringify(sessions, null, 2) + "\n", "utf8");
+        await rename(tmp, SESSIONS_FILE);
+        log(`INFO prune: removed ${removed} openai session entries from sessions.json`);
+      } catch (err) {
+        log(`WARN prune: write failed: ${err?.message ?? String(err)}`);
+        return; // Don't update stamp — prune didn't complete.
+      }
+    } else {
+      log("INFO prune: no openai session entries found");
+    }
+
+    // Update stamp.
+    try {
+      await writeFile(PRUNE_STAMP, String(Date.now()), "utf8");
+    } catch (err) {
+      log(`WARN prune: could not update stamp file: ${err?.message ?? String(err)}`);
+    }
+  } catch (err) {
+    log(`WARN prune: unexpected error: ${err?.message ?? String(err)}`);
+  }
+}
+
 // ─── Live-session stdin -> async generator ────────────────────────────────────
 //
 // OpenClaw writes user turns as JSON lines identical to SDKUserMessage:
@@ -190,6 +258,10 @@ async function main() {
     ` effort=${effort ?? "(default)"}` +
     ` resume=${resumeId ?? "none"}`,
   );
+
+  // Background maintenance: prune stale openai session keys from sessions.json.
+  // Fire-and-forget — never delays the turn.
+  pruneOldApiSessions();
 
   // Kick off file reads in parallel before we start consuming stdin.
   const [mcpServers, appendSystemPrompt] = await Promise.all([
