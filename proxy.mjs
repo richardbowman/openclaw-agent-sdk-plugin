@@ -150,11 +150,23 @@ function emit(obj) {
 const SESSIONS_FILE  = "/config/.openclaw/agents/main/sessions/sessions.json";
 const PRUNE_STAMP    = "/config/claude-sdk-proxy/last-prune.txt";
 const PRUNE_INTERVAL = 12 * 60 * 60 * 1000; // 12 hours
+const HA_TOKEN_FILE  = "/config/secrets/homeassistant.token";
+const HA_BASE_URL    = "http://172.30.32.1:8123";
+const RESTART_AUTO   = "automation.openclaw_twice_daily_restart";
+
+// Set to true by pruneOldApiSessions() when a prune ran this turn.
+// Checked after the response is fully streamed so the restart only fires
+// after OpenClaw has received the complete turn result.
+let _shouldRestartAfterTurn = false;
 
 /**
  * Prune stale "agent:main:openai:<uuid>" entries from OpenClaw's sessions
  * file.  Runs at most once every 12 hours (guarded by a stamp file).  Writes
  * back atomically via a .tmp rename so OpenClaw never sees a torn file.
+ *
+ * Sets _shouldRestartAfterTurn = true when entries were removed, so the
+ * caller can trigger an addon restart after the current turn finishes —
+ * ensuring OpenClaw reloads the clean file before it can overwrite it.
  *
  * Called fire-and-forget at the start of each turn — never delays a request.
  */
@@ -194,6 +206,8 @@ async function pruneOldApiSessions() {
         await writeFile(tmp, JSON.stringify(sessions, null, 2) + "\n", "utf8");
         await rename(tmp, SESSIONS_FILE);
         log(`INFO prune: removed ${removed} openai session entries from sessions.json`);
+        // Signal that a restart is needed so OpenClaw reloads the clean file.
+        _shouldRestartAfterTurn = true;
       } catch (err) {
         log(`WARN prune: write failed: ${err?.message ?? String(err)}`);
         return; // Don't update stamp — prune didn't complete.
@@ -210,6 +224,26 @@ async function pruneOldApiSessions() {
     }
   } catch (err) {
     log(`WARN prune: unexpected error: ${err?.message ?? String(err)}`);
+  }
+}
+
+/**
+ * Trigger the HA addon restart automation via the HA REST API.
+ * Called after the turn response is fully streamed so the restart doesn't
+ * interrupt an in-flight request.  The automation restarts OpenClaw, which
+ * then reloads the pruned sessions.json from disk.
+ */
+async function triggerAddonRestart() {
+  try {
+    const token = (await readFile(HA_TOKEN_FILE, "utf8")).trim();
+    const resp  = await fetch(`${HA_BASE_URL}/api/services/automation/trigger`, {
+      method:  "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
+      body:    JSON.stringify({ entity_id: RESTART_AUTO }),
+    });
+    log(`INFO prune: restart triggered (HTTP ${resp.status}) — clean sessions load on next startup`);
+  } catch (err) {
+    log(`WARN prune: could not trigger restart: ${err?.message ?? String(err)}`);
   }
 }
 
@@ -460,6 +494,12 @@ async function main() {
         session_id: message.session_id ?? "",
       });
     }
+  }
+
+  // If a prune ran this turn, trigger a restart now that the response is
+  // fully streamed.  OpenClaw will reload the clean sessions.json on startup.
+  if (_shouldRestartAfterTurn) {
+    await triggerAddonRestart();
   }
 
   log("done");
