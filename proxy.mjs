@@ -294,8 +294,9 @@ async function main() {
   );
 
   // Background maintenance: prune stale openai session keys from sessions.json.
-  // Fire-and-forget — never delays the turn.
-  pruneOldApiSessions();
+  // Stored (not awaited yet) so it runs concurrently with the turn but we can
+  // still await it after the response is streamed before checking the flag.
+  const pruneTask = pruneOldApiSessions();
 
   // Kick off file reads in parallel before we start consuming stdin.
   const [mcpServers, appendSystemPrompt] = await Promise.all([
@@ -495,6 +496,10 @@ async function main() {
       });
     }
   }
+
+  // Ensure the prune task has finished before we check its result flag —
+  // on fast turns (ping, short responses) it can still be running.
+  await pruneTask;
 
   // If a prune ran this turn, trigger a restart now that the response is
   // fully streamed.  OpenClaw will reload the clean sessions.json on startup.
