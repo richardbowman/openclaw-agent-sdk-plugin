@@ -203,10 +203,10 @@ async function pruneOldApiSessions() {
         await writeFile(tmp, JSON.stringify(sessions, null, 2) + "\n", "utf8");
         await rename(tmp, SESSIONS_FILE);
         log(`INFO prune: removed ${removed} openai session entries from sessions.json`);
-        // Fire restart immediately — don't wait for the turn. When sessions.list
-        // is degraded the turn times out and this process may be killed before
-        // the post-loop cleanup block is ever reached.
-        triggerAddonRestart(); // intentionally not awaited
+        // Await the restart so the HTTP call completes before this process exits.
+        // In per-turn mode the process exits right after pruneTask resolves, so
+        // a fire-and-forget call never gets a chance to make the network request.
+        await triggerAddonRestart();
       } catch (err) {
         log(`WARN prune: write failed: ${err?.message ?? String(err)}`);
         return; // Don't update stamp — prune didn't complete.
