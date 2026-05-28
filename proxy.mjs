@@ -97,6 +97,15 @@ for (let i = 0; i < argv.length; i++) {
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
 
+// Log all raw argv immediately so we can see exactly what OpenClaw passed.
+// appendFileSync is already imported above; this runs before main() is called.
+try {
+  appendFileSync(
+    "/config/claude-sdk-proxy/proxy.log",
+    `[claude-agent-sdk-proxy] ${new Date().toISOString()} RAW_ARGV: ${JSON.stringify(process.argv.slice(2))}\n`,
+  );
+} catch { /* ignore */ }
+
 // OpenClaw doesn't forward subprocess stderr to its supervisor log, so we
 // write to a file that can be tailed directly on the HA instance:
 //   ssh root@rhome.local "tail -f /addon_configs/17e0cc66_openclaw_assistant/claude-sdk-proxy/proxy.log"
@@ -245,6 +254,120 @@ async function triggerAddonRestart() {
   } catch (err) {
     log(`WARN prune: could not trigger restart: ${err?.message ?? String(err)}`);
   }
+}
+
+// ─── Self-managed session continuity ─────────────────────────────────────────
+//
+// OpenClaw's sessionIdFields / resumeArgs mechanism is not passing --resume
+// back to us — RAW_ARGV confirms resume=none on every single turn.
+// We implement session continuity ourselves:
+//
+//   1. extractChatId()   — parse the chat_id from OpenClaw's conversation-info
+//                          JSON block embedded in per-turn stdin
+//   2. loadChatSession() — look up the last session_id stored for this chat
+//   3. saveChatSession() — persist the new session_id after each turn
+//
+// Store is keyed by chat_id (e.g. "channel:1505916556989693953") and entries
+// expire after SESSION_MAX_AGE_MS so stale sessions don't cause SDK errors.
+
+const CHAT_SESSIONS_FILE = "/config/claude-sdk-proxy/chat-sessions.json";
+const SESSION_MAX_AGE_MS = 4 * 60 * 60 * 1000; // 4 hours
+
+/**
+ * Extract the chat_id from OpenClaw's per-turn stdin prompt.
+ * OpenClaw embeds a fenced JSON block:
+ *
+ *   Conversation info (untrusted metadata):
+ *   ```json
+ *   { "chat_id": "channel:...", ... }
+ *   ```
+ */
+function extractChatId(promptStr) {
+  if (typeof promptStr !== "string") return undefined;
+  const m = promptStr.match(/```json\s*\n([\s\S]*?)\n\s*```/);
+  if (!m) return undefined;
+  try {
+    return JSON.parse(m[1])?.chat_id ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Return the stored session_id for chatId, or undefined if absent or expired.
+ */
+async function loadChatSession(chatId) {
+  if (!chatId) return undefined;
+  try {
+    const store = JSON.parse(await readFile(CHAT_SESSIONS_FILE, "utf8"));
+    const entry = store[chatId];
+    if (!entry?.sessionId) return undefined;
+    const ageMs = Date.now() - (entry.ts ?? 0);
+    if (ageMs > SESSION_MAX_AGE_MS) {
+      log(`INFO session: ${chatId} expired (age ${Math.round(ageMs / 60000)}min), starting fresh`);
+      return undefined;
+    }
+    log(`INFO session: found ${chatId} → ${entry.sessionId} (age ${Math.round(ageMs / 60000)}min)`);
+    return entry.sessionId;
+  } catch {
+    // File absent on first run — that's fine.
+    return undefined;
+  }
+}
+
+/**
+ * Persist sessionId for chatId.  Atomic write via .tmp rename.
+ */
+async function saveChatSession(chatId, sessionId) {
+  if (!chatId || !sessionId) return;
+  try {
+    let store = {};
+    try { store = JSON.parse(await readFile(CHAT_SESSIONS_FILE, "utf8")); } catch {}
+    store[chatId] = { sessionId, ts: Date.now() };
+    const tmp = CHAT_SESSIONS_FILE + ".tmp";
+    await writeFile(tmp, JSON.stringify(store, null, 2) + "\n", "utf8");
+    await rename(tmp, CHAT_SESSIONS_FILE);
+    log(`INFO session: saved ${chatId} → ${sessionId}`);
+  } catch (err) {
+    log(`WARN session: could not save: ${err?.message ?? String(err)}`);
+  }
+}
+
+// ─── Assistant message enrichment ────────────────────────────────────────────
+//
+// OpenClaw labels a cli-backend response "empty" when the assistant message
+// has no text content block — only tool_use.  This happens on resumed
+// sessions where Claude goes straight to calling mcp__openclaw__message
+// without any preceding text.
+//
+// Fix: before emitting, check if the assistant message has tool_use for
+// mcp__openclaw__message but no text block.  If so, extract the message
+// text from the tool input and inject it as a leading text block.
+//
+// Safe: by the time we see the message in the for-await loop, the SDK has
+// already executed the MCP tool call and the Discord message is sent.
+// We're only adjusting the JSONL representation for openclaw's parser.
+
+function enrichAssistantMessage(message) {
+  if (message.type !== "assistant") return message;
+  // Content may live at message.content or message.message.content
+  const isNested = !message.content && !!message.message?.content;
+  const content  = message.content ?? message.message?.content;
+  if (!Array.isArray(content)) return message;
+  if (content.some((c) => c?.type === "text")) return message; // already has text
+  const msgTool = content.find(
+    (c) => c?.type === "tool_use" && c?.name === "mcp__openclaw__message",
+  );
+  if (!msgTool?.input) return message;
+  const text = msgTool.input.text ?? msgTool.input.content
+    ?? msgTool.input.message ?? msgTool.input.body ?? msgTool.input.msg
+    ?? JSON.stringify(msgTool.input);
+  if (!text) return message;
+  const enriched = [{ type: "text", text }, ...content];
+  if (isNested) {
+    return { ...message, message: { ...message.message, content: enriched } };
+  }
+  return { ...message, content: enriched };
 }
 
 // ─── Live-session stdin -> async generator ────────────────────────────────────
@@ -408,6 +531,41 @@ async function main() {
     log(`WARN bundled claude binary not found, falling back to PATH`);
   }
 
+  // NOTE: SessionStart JS hook callbacks are silently skipped by the SDK in
+  // subprocess mode. They only fire for external shell-script hooks configured
+  // in ~/.claude/settings.json. We emit the session_start event inline in the
+  // message loop below when we observe the system/init message instead.
+
+  // Choose prompt source based on mode.  In per-turn mode we also do session
+  // continuity lookup here, before building options, so resumeId is correct.
+  let prompt;
+  let chatId;  // chat_id from OpenClaw's conversation-info block (per-turn only)
+
+  if (isLiveSession) {
+    // Live session: long-lived process, multiple turns fed via stdin JSON.
+    prompt = liveSessionMessages();
+    log("DIAG stdin: live-session mode (generator — no preview)");
+  } else {
+    // Per-turn: read stdin as plain text, exit after the result.
+    prompt = await readAllStdin();
+    if (!prompt) return;
+    // Log a preview of stdin so we can see if OpenClaw sends JSON or plain text.
+    log(`DIAG stdin[0:300]: ${JSON.stringify(prompt.slice(0, 300))}`);
+
+    // Self-managed session continuity: OpenClaw never passes --resume
+    // (confirmed via RAW_ARGV — always none).  Look up the last session for
+    // this chat and resume it ourselves so Claude keeps context across turns.
+    chatId = extractChatId(prompt);
+    if (!resumeId && chatId) {
+      const storedSession = await loadChatSession(chatId);
+      if (storedSession) {
+        resumeId = storedSession;
+        log(`INFO session: self-managed resume=${resumeId} for chat=${chatId}`);
+      }
+    }
+  }
+
+  // Build options after stdin / session lookup so resumeId is final.
   const options = {
     pathToClaudeCodeExecutable: resolvedClaudePath,
 
@@ -461,40 +619,102 @@ async function main() {
     },
   };
 
-  // NOTE: SessionStart JS hook callbacks are silently skipped by the SDK in
-  // subprocess mode. They only fire for external shell-script hooks configured
-  // in ~/.claude/settings.json. We emit the session_start event inline in the
-  // message loop below when we observe the system/init message instead.
-
-  // Choose prompt source based on mode.
-  let prompt;
-
-  if (isLiveSession) {
-    // Live session: long-lived process, multiple turns fed via stdin JSON.
-    prompt = liveSessionMessages();
-  } else {
-    // Per-turn: read stdin as plain text, exit after the result.
-    prompt = await readAllStdin();
-    if (!prompt) return;
-  }
-
   // Run the agent and stream all SDK messages to stdout as JSONL.
+  let emittedSessionId;  // captured from first system/init — saved after loop
+  let capturedMsgText;   // text sent via mcp__openclaw__message — for result fix
+
   for await (const message of query({ prompt, options })) {
-    emit(message);
+    // ── Capture Discord message text ─────────────────────────────────────────
+    // When Claude calls mcp__openclaw__message, capture the message text so we
+    // can inject it into result/success.output if it would otherwise be empty.
+    if (message.type === "assistant") {
+      const content = message.content ?? message.message?.content;
+      if (Array.isArray(content)) {
+        const msgTool = content.find(
+          (c) => c?.type === "tool_use" && c?.name === "mcp__openclaw__message",
+        );
+        if (msgTool?.input) {
+          // Log full input so we can confirm the field name
+          log(`DIAG tool_input: ${JSON.stringify(msgTool.input).slice(0, 200)}`);
+          // Try common field names for the message text
+          capturedMsgText = msgTool.input.text ?? msgTool.input.content
+            ?? msgTool.input.message ?? msgTool.input.body ?? msgTool.input.msg;
+          if (!capturedMsgText && typeof msgTool.input === "object") {
+            // Scan all string values — skip action/target which are routing fields
+            for (const [k, v] of Object.entries(msgTool.input)) {
+              if (k !== "action" && k !== "target" && typeof v === "string" && v.length > 2) {
+                capturedMsgText = v;
+                log(`DIAG msg_text at key "${k}": ${v.slice(0, 80)}`);
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // ── Fix empty result/success.output ──────────────────────────────────────
+    // OpenClaw checks result.output to decide if the response is "empty".
+    // On resumed sessions Claude only calls the tool (no final text), leaving
+    // output empty → openclaw falls back to openai.  Inject the captured
+    // Discord message text so openclaw sees a non-empty response.
+    let outgoing = enrichAssistantMessage(message);
+    if (message.type === "result" && message.subtype === "success") {
+      log(`DIAG result_msg: ${JSON.stringify(message).slice(0, 300)}`);
+      const curOutput = message.result ?? message.output ?? "";
+      if (!curOutput && capturedMsgText) {
+        outgoing = { ...message, result: capturedMsgText };
+        log(`INFO result-fix: set result.result="${capturedMsgText.slice(0, 60)}" to prevent empty_response fallback`);
+      }
+    }
+    if (outgoing !== message && message.type === "assistant") {
+      log(`INFO enrich: injected text block into assistant message`);
+    }
+    emit(outgoing);
+
+    // Log every message we emit so we can trace the exact JSONL openclaw sees.
+    {
+      const mtype = [outgoing.type, outgoing.subtype].filter(Boolean).join("/");
+      const parts = [mtype];
+      if (outgoing.session_id) parts.push(`sid=${outgoing.session_id.slice(0, 8)}`);
+      if (outgoing.role)       parts.push(`role=${outgoing.role}`);
+      if (outgoing.stop_reason) parts.push(`stop=${outgoing.stop_reason}`);
+      if (outgoing.result !== undefined) parts.push(`result=${String(outgoing.result).slice(0, 40)}`);
+      if (outgoing.output !== undefined) parts.push(`output=${String(outgoing.output).slice(0, 40)}`);
+      const content = outgoing.content ?? outgoing.message?.content;
+      if (Array.isArray(content)) {
+        const summary = content.map((c) => {
+          if (c?.type === "text")        return `text(${String(c.text ?? "").slice(0, 40).replace(/\n/g, "↵")})`;
+          if (c?.type === "tool_use")    return `tool_use(${c.name ?? "?"})`;
+          if (c?.type === "tool_result") return `tool_result(${c.tool_use_id?.slice(0, 8) ?? "?"})`;
+          return c?.type ?? "?";
+        }).join(",");
+        parts.push(`content=[${summary}]`);
+      } else if (outgoing.type === "assistant") {
+        parts.push(`raw=${JSON.stringify(outgoing).slice(0, 300)}`);
+      }
+      log(`STDOUT ${parts.join(" ")}`);
+    }
 
     // Emit a session_start event on the first init message per session so
-    // OpenClaw can log session lifecycle. The SessionStart JS hook callback
-    // is silently skipped by the SDK in subprocess mode, so we derive the
-    // event from the init message instead. In live-session mode the SDK
-    // emits a fresh init line at the start of each turn; we emit a
-    // session_start alongside each one so per-turn tracking stays consistent.
+    // OpenClaw can log session lifecycle.
     if (message.type === "system" && message.subtype === "init") {
+      if (!emittedSessionId) emittedSessionId = message.session_id;
+      log(`DIAG session_id from SDK: ${message.session_id ?? "(none)"}`);
       emit({
         type:       "system",
         subtype:    "session_start",
         session_id: message.session_id ?? "",
       });
+      log(`STDOUT system/session_start sid=${(message.session_id ?? "").slice(0, 8)}`);
     }
+  }
+
+  // Persist the session_id so the next per-turn message for this chat
+  // can resume it (self-managed continuity, bypassing openclaw's broken
+  // sessionIdFields tracking).
+  if (!isLiveSession && chatId && emittedSessionId) {
+    await saveChatSession(chatId, emittedSessionId);
   }
 
   // Ensure the prune task has finished (stamp file written, restart fired).
