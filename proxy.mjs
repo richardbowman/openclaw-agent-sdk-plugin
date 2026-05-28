@@ -431,12 +431,12 @@ async function fetchOpenClawToolNames(endpoint) {
 }
 
 /**
- * Deliver text to a Discord channel via a direct POST to OpenClaw's MCP server.
- * Bypasses Claude's tool-call mechanism — the model never sees this call.
- * Returns true on success, false on any error.
+ * Send a new message to a Discord channel via OpenClaw's MCP server.
+ * Returns { ok: boolean, messageId: string|null } — messageId is parsed from
+ * the tool response if OpenClaw includes the Discord snowflake (17-19 digits).
  */
 async function deliverToChannel(endpoint, channelId, text) {
-  if (!endpoint || !channelId || !text?.trim()) return false;
+  if (!endpoint || !channelId || !text?.trim()) return { ok: false, messageId: null };
   try {
     const res = await fetch(endpoint.url, {
       method:  "POST",
@@ -447,16 +447,59 @@ async function deliverToChannel(endpoint, channelId, text) {
         method:  "tools/call",
         params:  { name: "message", arguments: { action: "send", target: channelId, message: text.trim() } },
       }),
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(8_000),
     });
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       log(`WARN deliverToChannel HTTP ${res.status}: ${body.slice(0, 120)}`);
+      return { ok: false, messageId: null };
+    }
+    const data     = await res.json().catch(() => null);
+    const respText = String(data?.result?.content?.[0]?.text ?? data?.result?.content ?? "");
+    log(`DIAG deliver-response: ${respText.slice(0, 150)}`);
+    // Discord snowflake IDs are 17-19 digit numbers — try to extract one.
+    const idMatch  = respText.match(/\b(\d{17,19})\b/);
+    return { ok: true, messageId: idMatch?.[1] ?? null };
+  } catch (err) {
+    log(`WARN deliverToChannel: ${err?.message ?? String(err)}`);
+    return { ok: false, messageId: null };
+  }
+}
+
+/**
+ * Edit an existing Discord message in-place via OpenClaw's MCP server.
+ * Tries action:"edit" with the message_id — returns true if the server accepted
+ * it, false if edit isn't supported or the call failed.
+ */
+async function editChannelMessage(endpoint, channelId, messageId, fullText) {
+  if (!endpoint || !channelId || !messageId || !fullText?.trim()) return false;
+  try {
+    const res = await fetch(endpoint.url, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", ...endpoint.headers },
+      body:    JSON.stringify({
+        jsonrpc: "2.0",
+        id:      Date.now(),
+        method:  "tools/call",
+        params:  {
+          name:      "message",
+          arguments: { action: "edit", target: channelId, message_id: messageId, message: fullText.trim() },
+        },
+      }),
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!res.ok) { log(`WARN editChannelMessage HTTP ${res.status}`); return false; }
+    const data     = await res.json().catch(() => null);
+    const respText = String(data?.result?.content?.[0]?.text ?? data?.result?.content ?? "");
+    log(`DIAG edit-response: ${respText.slice(0, 100)}`);
+    // Treat as failure if the server returned an error indicator
+    if (data?.result?.isError || /unknown action|not found|error/i.test(respText)) {
+      log("WARN editChannelMessage: server rejected edit action — falling back to send");
       return false;
     }
     return true;
   } catch (err) {
-    log(`WARN deliverToChannel: ${err?.message ?? String(err)}`);
+    log(`WARN editChannelMessage: ${err?.message ?? String(err)}`);
     return false;
   }
 }
@@ -792,6 +835,68 @@ async function main() {
   let firstAssistantSeen = false; // whether proxy has seen any assistant message yet
   let ackSent            = false; // whether a proxy-generated ack was sent this turn
 
+  // ── Edit-in-place Discord message state ────────────────────────────────────
+  // Instead of sending many separate Discord messages, we maintain one active
+  // message that grows as Claude narrates its work.  Tool status is appended as
+  // an ephemeral italic suffix (not included in baseContent) so it disappears
+  // naturally when the next text block arrives.
+  let activeMessageId    = null;  // Discord snowflake of the live message (if we got one)
+  let baseContent        = "";    // Accumulated delivered text (without tool-status suffix)
+  let toolCallCount      = 0;     // # of tool_use_end events this turn
+  let textSinceToolCount = 0;     // toolCallCount at last text delivery (for watchdog)
+
+  // Helper: compute the full message text to edit into Discord.
+  const fullMsg = (suffix = "") =>
+    suffix ? `${baseContent}\n\n${suffix}` : baseContent;
+
+  // Helper: deliver or update the Discord message with new text appended.
+  // Tries edit-in-place first (if we have a messageId); falls back to send.
+  async function pushText(text) {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const separator  = baseContent ? "\n" : "";
+    const newBase    = baseContent + separator + trimmed;
+    // Discord hard limit is 2000 chars — start a new message if we'd overflow.
+    if (activeMessageId && newBase.length <= 1900) {
+      const ok = await editChannelMessage(openClawEndpoint, channelTarget, activeMessageId, newBase);
+      if (ok) { baseContent = newBase; capturedMsgText = newBase; return; }
+      // Edit failed (tool doesn't support it, or message was deleted) — fall through.
+      activeMessageId = null;
+    }
+    const result = await deliverToChannel(openClawEndpoint, channelTarget,
+      // If accumulated too long, send only the new piece as a fresh message.
+      newBase.length <= 1900 ? newBase : trimmed);
+    if (result.ok) {
+      activeMessageId = result.messageId ?? null;
+      baseContent     = newBase.length <= 1900 ? newBase : trimmed;
+      capturedMsgText = baseContent;
+    }
+  }
+
+  // Helper: edit the current message to show a tool-status suffix without
+  // changing baseContent (the suffix is ephemeral; next pushText call removes it).
+  async function showToolStatus(suffix) {
+    if (!activeMessageId || !baseContent) return;
+    await editChannelMessage(openClawEndpoint, channelTarget, activeMessageId, fullMsg(suffix));
+  }
+
+  // SIGTERM handler — if OpenClaw kills the subprocess mid-turn, try to edit
+  // the active message with a "cut off" notice so the user knows what happened.
+  // Best-effort: localhost HTTP call should complete before SIGKILL arrives.
+  const onSigterm = async () => {
+    try {
+      if (activeMessageId && channelTarget && openClawEndpoint && baseContent) {
+        await editChannelMessage(
+          openClawEndpoint, channelTarget, activeMessageId,
+          baseContent + "\n\n_⚠️ Response was cut off — please ask me to continue._",
+        );
+        log("INFO sigterm: edited active message with cutoff notice");
+      }
+    } catch { /* best-effort */ }
+    process.exit(0);
+  };
+  process.once("SIGTERM", onSigterm);
+
   // ── Tool-use keepalive ────────────────────────────────────────────────────
   // OpenClaw's stdout reader can time out during long tool executions since the
   // SDK emits nothing between tool_use and tool_result.  We:
@@ -818,40 +923,45 @@ async function main() {
   }
 
   for await (const message of query({ prompt, options })) {
-    // ── Auto-deliver Claude's text to Discord ─────────────────────────────────
-    // The proxy intercepts every assistant text block and sends it to Discord
-    // directly via a fetch() to OpenClaw's MCP HTTP server.  Claude just writes
-    // normal responses — it has no channel awareness or delivery obligations.
+    // ── Auto-deliver Claude's text to Discord (edit-in-place) ────────────────
+    // Every assistant text block is delivered immediately via pushText(), which
+    // edits the existing Discord message in-place (growing it) rather than
+    // spamming new messages.  Tool status is shown as an ephemeral italic suffix.
     //
-    // Auto-ack: if the very first assistant message contains only tool_use blocks
-    // (Claude went straight to work with no opening line), inject a proxy-generated
-    // ack so the user sees immediate activity.
+    // Auto-ack: if Claude's first move is pure tool-use with no opening text,
+    // the proxy injects "⏳ On it..." so the user sees activity immediately.
     if (message.type === "assistant" && channelTarget && openClawEndpoint) {
       const content    = message.content ?? message.message?.content;
       if (Array.isArray(content)) {
         const textBlocks = content.filter(c => c?.type === "text" && c.text?.trim());
-        const hasTools   = content.some(c => c?.type === "tool_use");
+        const toolBlocks = content.filter(c => c?.type === "tool_use");
 
-        if (!firstAssistantSeen && textBlocks.length === 0 && hasTools && !ackSent) {
-          const ackText = "⏳ On it...";
-          const ok = await deliverToChannel(openClawEndpoint, channelTarget, ackText);
-          if (ok) {
-            ackSent = true;
-            capturedMsgText = ackText;
-            log(`INFO proxy-ack: sent "${ackText}" to ${channelTarget}`);
+        // Auto-ack on first pure-tool message (no text to deliver yet).
+        if (!firstAssistantSeen && textBlocks.length === 0 && toolBlocks.length > 0 && !ackSent) {
+          const result = await deliverToChannel(openClawEndpoint, channelTarget, "⏳ On it...");
+          if (result.ok) {
+            ackSent         = true;
+            activeMessageId = result.messageId ?? null;
+            baseContent     = "⏳ On it...";
+            capturedMsgText = baseContent;
+            log(`INFO proxy-ack: sent to ${channelTarget} (msgId=${activeMessageId ?? "none"})`);
           } else {
             log(`WARN proxy-ack: delivery failed for ${channelTarget}`);
           }
         }
 
+        // Deliver each text block — edit the existing message or send new.
         for (const block of textBlocks) {
-          const ok = await deliverToChannel(openClawEndpoint, channelTarget, block.text);
-          if (ok) {
-            capturedMsgText = block.text;
-            log(`INFO auto-deliver: ${block.text.length} chars → ${channelTarget}: ${block.text.slice(0, 60).replace(/\n/g, "↵")}`);
-          } else {
-            log(`WARN auto-deliver: delivery failed for ${channelTarget}`);
-          }
+          await pushText(block.text);
+          textSinceToolCount = toolCallCount;
+          log(`INFO auto-deliver: ${block.text.length} chars → ${channelTarget}: ${block.text.slice(0, 60).replace(/\n/g, "↵")}`);
+        }
+
+        // Show ephemeral tool-status suffix for the tools about to run.
+        if (toolBlocks.length > 0) {
+          const names  = toolBlocks.map(b => b.name ?? "tool").join(", ");
+          await showToolStatus(`_⚙️ ${names}…_`);
+          log(`INFO tool-status: ${names}`);
         }
 
         firstAssistantSeen = true;
@@ -903,6 +1013,15 @@ async function main() {
           emit({ type: "system", subtype: "tool_use_end", tool_name: tname,
                  session_id: emittedSessionId ?? "" });
           log(`STDOUT system/tool_use_end tool=${tname}`);
+          toolCallCount++;
+
+          // Watchdog: every 5 tool calls without new text, edit the Discord message
+          // so the user knows the bot is still alive (not just hung silently).
+          const callsSinceText = toolCallCount - textSinceToolCount;
+          if (channelTarget && openClawEndpoint && callsSinceText > 0 && callsSinceText % 5 === 0) {
+            await showToolStatus(`_⏳ Still working… (${toolCallCount} tool calls so far)_`);
+            log(`INFO watchdog: updated Discord message at ${toolCallCount} tool calls`);
+          }
         }
       }
     }
@@ -970,6 +1089,7 @@ async function main() {
   }
 
   stopToolKeepalive(); // ensure timer is cleared if loop exits early
+  process.off("SIGTERM", onSigterm); // normal exit — no cutoff notice needed
 
   // Persist the session_id so the next per-turn message for this chat
   // can resume it (self-managed continuity, bypassing openclaw's broken
