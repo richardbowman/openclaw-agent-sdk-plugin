@@ -623,13 +623,6 @@ async function main() {
   // the chatId is already in "channel:ID" form; otherwise empty string.
   const channelTarget = chatId?.startsWith("channel:") ? chatId : "";
 
-  // Maximum agentic turns (assistant→tools→assistant cycles) for Discord channel
-  // turns.  Prevents runaway research sessions that exhaust OpenClaw's subprocess
-  // timeout (~6-7 min) and deliver nothing.  15 turns ≈ 15-45 tool calls for
-  // most patterns; generous enough for legitimate multi-step tasks but far below
-  // the 30+ spiral that caused the ce043e68 timeout.
-  const MAX_TURNS_DISCORD = 15;
-
   const proxySystemAddition = channelTarget
     ? [
         "",
@@ -667,9 +660,6 @@ async function main() {
     ...(permissionMode    && { permissionMode }),
     ...(effort            && { effort }),
     ...(mcpServers        && { mcpServers }),
-    // Cap agentic turns for Discord channel turns to prevent runaway sessions
-    // being killed by OpenClaw's subprocess timeout with no response delivered.
-    ...(channelTarget     && { maxTurns: MAX_TURNS_DISCORD }),
     ...(combinedAppend && {
       systemPrompt: {
         type:   "preset",
@@ -825,19 +815,12 @@ async function main() {
       log(`DIAG result_msg: ${JSON.stringify(message).slice(0, 300)}`);
       const stopReason = message.stop_reason ?? message.stopReason ?? "";
       if (stopReason === "max_turns") {
-        log(`WARN result: max_turns hit — turn was capped at ${MAX_TURNS_DISCORD} agentic turns; Claude may not have finished`);
+        log(`WARN result: max_turns stop_reason — Claude may not have finished (no hard cap set; this came from the SDK itself)`);
       }
       const curOutput = message.result ?? message.output ?? "";
       if (!curOutput && capturedMsgText) {
         outgoing = { ...message, result: capturedMsgText };
         log(`INFO result-fix: set result.result="${capturedMsgText.slice(0, 60)}" to prevent empty_response fallback`);
-      } else if (!curOutput && stopReason === "max_turns") {
-        // Claude hit the turn cap without sending anything via the message tool.
-        // Inject a fallback so OpenClaw doesn't treat this as an empty response
-        // and fall back to GPT.  The user still won't see a Discord message here,
-        // but at least the session is preserved for their next turn.
-        outgoing = { ...message, result: "[Research limit reached — please ask me to continue]" };
-        log(`INFO result-fix: max_turns with no captured message — injecting fallback result`);
       }
     }
     if (outgoing !== message && message.type === "assistant") {
