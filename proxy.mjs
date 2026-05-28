@@ -611,6 +611,28 @@ async function main() {
     }
   }
 
+  // ── Proxy-injected system prompt addition ────────────────────────────────
+  // For Discord channel turns, instruct Claude to send a brief status message
+  // via the message tool before starting any tool-heavy work so the user sees
+  // immediate activity rather than silence.
+  //
+  // Voice turns return text directly — there is no message tool to route
+  // status through, and cron jobs never interact with users, so we skip both.
+  const proxySystemAddition = chatId?.startsWith("channel:")
+    ? [
+        "",
+        "## Immediate Acknowledgment",
+        "When the user's request requires tool use or will take more than a moment",
+        "to answer, call the message tool FIRST with a brief status before starting",
+        "work — for example: \"⏳ On it...\" or \"🔍 Searching...\" or",
+        "\"🛠️ Give me a moment...\". Skip only when you can answer immediately",
+        "without any tool calls.",
+      ].join("\n")
+    : "";
+
+  const combinedAppend = [appendSystemPrompt, proxySystemAddition]
+    .filter(Boolean).join("\n");
+
   // Build options after stdin / session lookup so resumeId is final.
   const options = {
     pathToClaudeCodeExecutable: resolvedClaudePath,
@@ -624,11 +646,11 @@ async function main() {
     ...(permissionMode    && { permissionMode }),
     ...(effort            && { effort }),
     ...(mcpServers        && { mcpServers }),
-    ...(appendSystemPrompt && {
+    ...(combinedAppend && {
       systemPrompt: {
         type:   "preset",
         preset: "claude_code",
-        append: appendSystemPrompt,
+        append: combinedAppend,
       },
     }),
 
