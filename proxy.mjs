@@ -578,12 +578,28 @@ async function main() {
       // Log OpenClaw env vars that might carry a per-conversation identifier
       log(`DIAG voice env: AGENT_ID=${process.env.OPENCLAW_MCP_AGENT_ID ?? "(unset)"} CHANNEL=${process.env.OPENCLAW_MCP_MESSAGE_CHANNEL ?? "(unset)"} EVENT_KIND=${process.env.OPENCLAW_MCP_INBOUND_EVENT_KIND ?? "(unset)"} SESSION_KEY=${(process.env.OPENCLAW_MCP_SESSION_KEY ?? "(unset)").slice(0, 16)}`);
       // Derive a stable key from OpenClaw's per-instance env vars.
-      // CHANNEL=voice, AGENT_ID=main — both are constant for the addon lifetime
-      // but would differ if a second voice agent or channel type were added.
+      // Confirmed via DIAG: CHANNEL=voice, AGENT_ID=main for HA Assist turns.
+      // Both are constant for the addon lifetime but would differ if a second
+      // voice agent or channel type were added.
       const ocChannel = process.env.OPENCLAW_MCP_MESSAGE_CHANNEL || "voice";
       const ocAgent   = process.env.OPENCLAW_MCP_AGENT_ID        || "main";
       chatId = `${ocChannel}:${ocAgent}`;
       log(`INFO session: no chat_id in stdin — treating as voice turn, chatId=${chatId}`);
+    }
+
+    // For voice turns, override the model to haiku regardless of what OpenClaw
+    // configured.  OpenClaw's channel binding targets "openai" but HA Assist
+    // actually uses the "voice" channel, so voice requests always fall through
+    // to the main agent (sonnet).  We enforce the faster haiku model here as a
+    // reliable proxy-side override that does not depend on OpenClaw routing.
+    // If the binding is later fixed so OpenClaw routes to ha-voice and passes
+    // haiku itself, this block becomes a no-op.
+    if (chatId?.startsWith("voice:")) {
+      const VOICE_MODEL = "claude-haiku-4-5";
+      if (model !== VOICE_MODEL) {
+        log(`INFO voice: overriding model ${model ?? "(default)"} → ${VOICE_MODEL} (OpenClaw routes voice to main/sonnet; ha-voice binding not matched)`);
+        model = VOICE_MODEL;
+      }
     }
 
     if (!resumeId && chatId) {
@@ -653,6 +669,31 @@ async function main() {
   let emittedSessionId;  // captured from first system/init — saved after loop
   let capturedMsgText;   // text sent via mcp__openclaw__message — for result fix
 
+  // ── Tool-use keepalive ────────────────────────────────────────────────────
+  // OpenClaw's stdout reader can time out during long tool executions since the
+  // SDK emits nothing between tool_use and tool_result.  We:
+  //   (a) immediately emit system/tool_use_start ourselves (JS hooks don't fire
+  //       in subprocess mode — confirmed by absence in STDOUT log), and
+  //   (b) fire a heartbeat every 8 s via setInterval while the tool is running
+  //       so OpenClaw's read timeout never triggers.
+  let activeToolName  = null;
+  let keepaliveTimer  = null;
+
+  function startToolKeepalive(toolName) {
+    activeToolName = toolName;
+    clearInterval(keepaliveTimer);
+    keepaliveTimer = setInterval(() => {
+      emit({ type: "system", subtype: "heartbeat", tool_name: toolName,
+             session_id: emittedSessionId ?? "" });
+      log(`KEEPALIVE heartbeat tool=${toolName}`);
+    }, 8_000);
+  }
+
+  function stopToolKeepalive() {
+    if (keepaliveTimer) { clearInterval(keepaliveTimer); keepaliveTimer = null; }
+    activeToolName = null;
+  }
+
   for await (const message of query({ prompt, options })) {
     // ── Capture Discord message text ─────────────────────────────────────────
     // When Claude calls mcp__openclaw__message, capture the message text so we
@@ -660,6 +701,18 @@ async function main() {
     if (message.type === "assistant") {
       const content = message.content ?? message.message?.content;
       if (Array.isArray(content)) {
+        // Emit tool_use_start for every tool_use block (hooks don't fire in
+        // subprocess mode so we do it here from the message stream).
+        for (const block of content) {
+          if (block?.type === "tool_use") {
+            const tname = block.name ?? "tool";
+            emit({ type: "system", subtype: "tool_use_start", tool_name: tname,
+                   session_id: emittedSessionId ?? "" });
+            log(`STDOUT system/tool_use_start tool=${tname}`);
+            startToolKeepalive(tname);
+          }
+        }
+
         const msgTool = content.find(
           (c) => c?.type === "tool_use" && c?.name === "mcp__openclaw__message",
         );
@@ -683,6 +736,18 @@ async function main() {
       }
     }
 
+    // ── Tool result received — stop keepalive, emit tool_use_end ─────────────
+    if (message.type === "user") {
+      const content = message.content ?? message.message?.content;
+      if (Array.isArray(content) && content.some((c) => c?.type === "tool_result")) {
+        const tname = activeToolName ?? "tool";
+        stopToolKeepalive();
+        emit({ type: "system", subtype: "tool_use_end", tool_name: tname,
+               session_id: emittedSessionId ?? "" });
+        log(`STDOUT system/tool_use_end tool=${tname}`);
+      }
+    }
+
     // ── Fix empty result/success.output ──────────────────────────────────────
     // OpenClaw checks result.output to decide if the response is "empty".
     // On resumed sessions Claude only calls the tool (no final text), leaving
@@ -690,6 +755,7 @@ async function main() {
     // Discord message text so openclaw sees a non-empty response.
     let outgoing = enrichAssistantMessage(message);
     if (message.type === "result" && message.subtype === "success") {
+      stopToolKeepalive(); // belt-and-suspenders — clear any lingering timer
       log(`DIAG result_msg: ${JSON.stringify(message).slice(0, 300)}`);
       const curOutput = message.result ?? message.output ?? "";
       if (!curOutput && capturedMsgText) {
@@ -739,6 +805,8 @@ async function main() {
       log(`STDOUT system/session_start sid=${(message.session_id ?? "").slice(0, 8)}`);
     }
   }
+
+  stopToolKeepalive(); // ensure timer is cleared if loop exits early
 
   // Persist the session_id so the next per-turn message for this chat
   // can resume it (self-managed continuity, bypassing openclaw's broken
