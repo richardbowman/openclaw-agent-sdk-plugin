@@ -618,15 +618,20 @@ async function main() {
   //
   // Voice turns return text directly — there is no message tool to route
   // status through, and cron jobs never interact with users, so we skip both.
-  const proxySystemAddition = chatId?.startsWith("channel:")
+  // Extract the raw channel ID so we can tell Claude the exact target to use
+  // in the ack mcp__openclaw__message call.  Falls back to the full chatId if
+  // the chatId is already in "channel:ID" form; otherwise empty string.
+  const channelTarget = chatId?.startsWith("channel:") ? chatId : "";
+
+  const proxySystemAddition = channelTarget
     ? [
         "",
         "## Immediate Acknowledgment",
-        "When the user's request requires tool use or will take more than a moment",
-        "to answer, call the message tool FIRST with a brief status before starting",
-        "work — for example: \"⏳ On it...\" or \"🔍 Searching...\" or",
-        "\"🛠️ Give me a moment...\". Skip only when you can answer immediately",
-        "without any tool calls.",
+        `When the user's request requires tool use or will take more than a moment`,
+        `to answer, call the message tool FIRST with a brief status before starting`,
+        `work. Use target="${channelTarget}" and a short message such as`,
+        `"⏳ On it..." or "🔍 Searching..." or "🛠️ Give me a moment...".`,
+        `Skip only when you can answer immediately without any tool calls.`,
       ].join("\n")
     : "";
 
@@ -761,12 +766,32 @@ async function main() {
     // ── Tool result received — stop keepalive, emit tool_use_end ─────────────
     if (message.type === "user") {
       const content = message.content ?? message.message?.content;
-      if (Array.isArray(content) && content.some((c) => c?.type === "tool_result")) {
-        const tname = activeToolName ?? "tool";
-        stopToolKeepalive();
-        emit({ type: "system", subtype: "tool_use_end", tool_name: tname,
-               session_id: emittedSessionId ?? "" });
-        log(`STDOUT system/tool_use_end tool=${tname}`);
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block?.type === "tool_result") {
+            const isErr = block.is_error === true;
+            // Log errors from tool calls so we can diagnose failed mcp__openclaw__message sends
+            if (isErr) {
+              const errText = Array.isArray(block.content)
+                ? block.content.map((c) => c?.text ?? "").join(" ").slice(0, 200)
+                : String(block.content ?? "").slice(0, 200);
+              log(`WARN tool_result ERROR id=${block.tool_use_id?.slice(0, 8) ?? "?"}: ${errText}`);
+            } else if (activeToolName === "mcp__openclaw__message") {
+              // Log success for the message tool so we know delivery worked
+              const okText = Array.isArray(block.content)
+                ? block.content.map((c) => c?.text ?? "").join(" ").slice(0, 100)
+                : String(block.content ?? "").slice(0, 100);
+              log(`INFO tool_result mcp__openclaw__message OK: ${okText || "(empty)"}`);
+            }
+          }
+        }
+        if (content.some((c) => c?.type === "tool_result")) {
+          const tname = activeToolName ?? "tool";
+          stopToolKeepalive();
+          emit({ type: "system", subtype: "tool_use_end", tool_name: tname,
+                 session_id: emittedSessionId ?? "" });
+          log(`STDOUT system/tool_use_end tool=${tname}`);
+        }
       }
     }
 
