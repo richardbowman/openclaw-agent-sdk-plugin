@@ -457,21 +457,22 @@ async function deliverToChannel(endpoint, channelId, text) {
     const data     = await res.json().catch(() => null);
     const respText = String(data?.result?.content?.[0]?.text ?? data?.result?.content ?? "");
     log(`DIAG deliver-response: ${respText.slice(0, 300)}`);
-    // The response text is likely a JSON-serialised Discord message object.
-    // Parse it properly to extract the message's own 'id' field — we cannot
-    // use a bare regex because the JSON also contains channel_id, guild_id,
-    // author.id, etc. which are all 17-19 digit snowflakes that would cause
-    // the edit to target the wrong object.
+    // OpenClaw returns its own envelope, not a raw Discord message object:
+    //   { channel, to, result: { receipt: {
+    //       primaryPlatformMessageId: "1509...",
+    //       platformMessageIds: ["1509..."],
+    //       ...
+    //   } } }
     let messageId = null;
     try {
-      const parsed = JSON.parse(respText);
-      const raw    = parsed?.id ?? parsed?.message_id ?? parsed?.messageId;
+      const parsed  = JSON.parse(respText);
+      const receipt = parsed?.result?.receipt;
+      const raw     = receipt?.primaryPlatformMessageId
+                   ?? receipt?.platformMessageIds?.[0]
+                   // fallback paths in case OpenClaw changes shape
+                   ?? parsed?.id ?? parsed?.message_id ?? parsed?.messageId;
       if (raw && /^\d{17,19}$/.test(String(raw))) messageId = String(raw);
-    } catch {
-      // Not JSON — fall back to bare regex and hope there's only one snowflake.
-      const m = respText.match(/\b(\d{17,19})\b/);
-      messageId = m?.[1] ?? null;
-    }
+    } catch { /* not JSON — no safe regex fallback, leave null */ }
     log(`DIAG deliver-messageId: ${messageId ?? "(none)"}`);
     return { ok: true, messageId };
   } catch (err) {
@@ -497,7 +498,10 @@ async function editChannelMessage(endpoint, channelId, messageId, fullText) {
         method:  "tools/call",
         params:  {
           name:      "message",
-          arguments: { action: "edit", target: channelId, message_id: messageId, message: fullText.trim() },
+          // Try both snake_case and camelCase for the message ID field name —
+          // the winning variant will be clear from DIAG edit-response in the log.
+          arguments: { action: "edit", target: channelId,
+                       message_id: messageId, messageId, message: fullText.trim() },
         },
       }),
       signal: AbortSignal.timeout(8_000),
