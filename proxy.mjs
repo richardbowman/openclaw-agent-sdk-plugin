@@ -578,12 +578,28 @@ async function main() {
       // Log OpenClaw env vars that might carry a per-conversation identifier
       log(`DIAG voice env: AGENT_ID=${process.env.OPENCLAW_MCP_AGENT_ID ?? "(unset)"} CHANNEL=${process.env.OPENCLAW_MCP_MESSAGE_CHANNEL ?? "(unset)"} EVENT_KIND=${process.env.OPENCLAW_MCP_INBOUND_EVENT_KIND ?? "(unset)"} SESSION_KEY=${(process.env.OPENCLAW_MCP_SESSION_KEY ?? "(unset)").slice(0, 16)}`);
       // Derive a stable key from OpenClaw's per-instance env vars.
-      // CHANNEL=voice, AGENT_ID=main — both are constant for the addon lifetime
-      // but would differ if a second voice agent or channel type were added.
+      // Confirmed via DIAG: CHANNEL=voice, AGENT_ID=main for HA Assist turns.
+      // Both are constant for the addon lifetime but would differ if a second
+      // voice agent or channel type were added.
       const ocChannel = process.env.OPENCLAW_MCP_MESSAGE_CHANNEL || "voice";
       const ocAgent   = process.env.OPENCLAW_MCP_AGENT_ID        || "main";
       chatId = `${ocChannel}:${ocAgent}`;
       log(`INFO session: no chat_id in stdin — treating as voice turn, chatId=${chatId}`);
+    }
+
+    // For voice turns, override the model to haiku regardless of what OpenClaw
+    // configured.  OpenClaw's channel binding targets "openai" but HA Assist
+    // actually uses the "voice" channel, so voice requests always fall through
+    // to the main agent (sonnet).  We enforce the faster haiku model here as a
+    // reliable proxy-side override that does not depend on OpenClaw routing.
+    // If the binding is later fixed so OpenClaw routes to ha-voice and passes
+    // haiku itself, this block becomes a no-op.
+    if (chatId?.startsWith("voice:")) {
+      const VOICE_MODEL = "claude-haiku-4-5";
+      if (model !== VOICE_MODEL) {
+        log(`INFO voice: overriding model ${model ?? "(default)"} → ${VOICE_MODEL} (OpenClaw routes voice to main/sonnet; ha-voice binding not matched)`);
+        model = VOICE_MODEL;
+      }
     }
 
     if (!resumeId && chatId) {
