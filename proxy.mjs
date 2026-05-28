@@ -456,10 +456,24 @@ async function deliverToChannel(endpoint, channelId, text) {
     }
     const data     = await res.json().catch(() => null);
     const respText = String(data?.result?.content?.[0]?.text ?? data?.result?.content ?? "");
-    log(`DIAG deliver-response: ${respText.slice(0, 150)}`);
-    // Discord snowflake IDs are 17-19 digit numbers — try to extract one.
-    const idMatch  = respText.match(/\b(\d{17,19})\b/);
-    return { ok: true, messageId: idMatch?.[1] ?? null };
+    log(`DIAG deliver-response: ${respText.slice(0, 300)}`);
+    // The response text is likely a JSON-serialised Discord message object.
+    // Parse it properly to extract the message's own 'id' field — we cannot
+    // use a bare regex because the JSON also contains channel_id, guild_id,
+    // author.id, etc. which are all 17-19 digit snowflakes that would cause
+    // the edit to target the wrong object.
+    let messageId = null;
+    try {
+      const parsed = JSON.parse(respText);
+      const raw    = parsed?.id ?? parsed?.message_id ?? parsed?.messageId;
+      if (raw && /^\d{17,19}$/.test(String(raw))) messageId = String(raw);
+    } catch {
+      // Not JSON — fall back to bare regex and hope there's only one snowflake.
+      const m = respText.match(/\b(\d{17,19})\b/);
+      messageId = m?.[1] ?? null;
+    }
+    log(`DIAG deliver-messageId: ${messageId ?? "(none)"}`);
+    return { ok: true, messageId };
   } catch (err) {
     log(`WARN deliverToChannel: ${err?.message ?? String(err)}`);
     return { ok: false, messageId: null };
@@ -491,10 +505,11 @@ async function editChannelMessage(endpoint, channelId, messageId, fullText) {
     if (!res.ok) { log(`WARN editChannelMessage HTTP ${res.status}`); return false; }
     const data     = await res.json().catch(() => null);
     const respText = String(data?.result?.content?.[0]?.text ?? data?.result?.content ?? "");
-    log(`DIAG edit-response: ${respText.slice(0, 100)}`);
-    // Treat as failure if the server returned an error indicator
-    if (data?.result?.isError || /unknown action|not found|error/i.test(respText)) {
-      log("WARN editChannelMessage: server rejected edit action — falling back to send");
+    log(`DIAG edit-response: ${respText.slice(0, 150)}`);
+    // "Unknown Message" = Discord 10008 — wrong message ID or message deleted.
+    // Treat any non-success response as failure so pushText falls back to send.
+    if (data?.result?.isError || /unknown|not found|error|invalid/i.test(respText)) {
+      log(`WARN editChannelMessage: rejected (${respText.slice(0, 60)}) — falling back to send`);
       return false;
     }
     return true;
