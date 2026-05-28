@@ -374,6 +374,93 @@ function enrichAssistantMessage(message) {
   return { ...message, content: enriched };
 }
 
+// ─── OpenClaw HTTP endpoint helpers ───────────────────────────────────────────
+//
+// OpenClaw's MCP server is HTTP-based (url: "http://127.0.0.1:<port>/mcp").
+// We can call it directly from the proxy with fetch() — no Claude involvement.
+// This lets us intercept Claude's text output and route it to Discord ourselves,
+// keeping the model completely unaware of channels, tool names, or delivery.
+
+/**
+ * Parse the MCP config file written by OpenClaw and return { url, headers }
+ * with ${ENV_VAR} placeholders expanded from process.env.
+ * Returns null if absent, not HTTP-based, or unreadable.
+ */
+async function loadOpenClawEndpoint(cfgPath) {
+  if (!cfgPath) return null;
+  try {
+    const raw     = JSON.parse(await readFile(cfgPath, "utf8"));
+    const servers = raw.mcpServers ?? {};
+    const server  = servers.openclaw ?? Object.values(servers)[0];
+    if (!server?.url) { log("WARN loadOpenClawEndpoint: no url in mcp config"); return null; }
+    const expand  = (s) => String(s).replace(/\$\{([^}]+)\}/g, (_, k) => process.env[k] ?? "");
+    const url     = expand(server.url);
+    const headers = {};
+    for (const [k, v] of Object.entries(server.headers ?? {})) headers[k] = expand(v);
+    log(`INFO openclaw-endpoint: ${url}`);
+    return { url, headers };
+  } catch (err) {
+    log(`WARN loadOpenClawEndpoint: ${err?.message ?? String(err)}`);
+    return null;
+  }
+}
+
+/**
+ * List tools from OpenClaw's MCP server and return them in Claude Code's
+ * mcp__openclaw__<name> format.  Returns null on any failure.
+ */
+async function fetchOpenClawToolNames(endpoint) {
+  if (!endpoint) return null;
+  try {
+    const res = await fetch(endpoint.url, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", ...endpoint.headers },
+      body:    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      signal:  AbortSignal.timeout(5_000),
+    });
+    if (!res.ok) { log(`WARN fetchOpenClawToolNames HTTP ${res.status}`); return null; }
+    const data  = await res.json();
+    const tools = data?.result?.tools ?? [];
+    const names = tools.map(t => `mcp__openclaw__${t.name}`);
+    log(`INFO openclaw-tools: [${names.join(", ")}]`);
+    return names;
+  } catch (err) {
+    log(`WARN fetchOpenClawToolNames: ${err?.message ?? String(err)}`);
+    return null;
+  }
+}
+
+/**
+ * Deliver text to a Discord channel via a direct POST to OpenClaw's MCP server.
+ * Bypasses Claude's tool-call mechanism — the model never sees this call.
+ * Returns true on success, false on any error.
+ */
+async function deliverToChannel(endpoint, channelId, text) {
+  if (!endpoint || !channelId || !text?.trim()) return false;
+  try {
+    const res = await fetch(endpoint.url, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", ...endpoint.headers },
+      body:    JSON.stringify({
+        jsonrpc: "2.0",
+        id:      Date.now(),
+        method:  "tools/call",
+        params:  { name: "message", arguments: { action: "send", target: channelId, message: text.trim() } },
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      log(`WARN deliverToChannel HTTP ${res.status}: ${body.slice(0, 120)}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    log(`WARN deliverToChannel: ${err?.message ?? String(err)}`);
+    return false;
+  }
+}
+
 // ─── Live-session stdin -> async generator ────────────────────────────────────
 //
 // OpenClaw writes user turns as JSON lines identical to SDKUserMessage:
@@ -623,35 +710,33 @@ async function main() {
   // the chatId is already in "channel:ID" form; otherwise empty string.
   const channelTarget = chatId?.startsWith("channel:") ? chatId : "";
 
-  const proxySystemAddition = channelTarget
-    ? [
-        "",
-        "## Discord Response Requirements",
-        `You are operating as a Discord bot. The user ONLY sees messages you explicitly`,
-        `send via the message tool with target="${channelTarget}". Your final assistant`,
-        `text is NOT shown to the user — you must use mcp__openclaw__message for all`,
-        `response delivery.`,
-        "",
-        "**Workflow for every request:**",
-        `1. If the request requires tool use, send a brief acknowledgment first`,
-        `   (e.g. "⏳ On it..." or "🔍 Searching...") using target="${channelTarget}".`,
-        `2. Complete your work efficiently — aim for ~8 tool uses or fewer.`,
-        `3. ALWAYS finish by calling the message tool with your findings, even if`,
-        `   partial. A timely partial answer is far better than silence.`,
-        "",
-        `If you cannot finish within ~8 tool uses, send what you have found so far`,
-        `and stop. Do not attempt to gather more data when you are running long.`,
-      ].join("\n")
-    : "";
+  // ── OpenClaw endpoint + tool list (Discord turns only) ─────────────────────
+  // The proxy auto-delivers Claude's text output to Discord directly — Claude
+  // never sees mcp__openclaw__message and needs no channel-routing knowledge.
+  const openClawEndpoint = channelTarget ? await loadOpenClawEndpoint(mcpConfigFile) : null;
 
-  const combinedAppend = [appendSystemPrompt, proxySystemAddition]
-    .filter(Boolean).join("\n");
+  // Build the effective allowed-tools list.  For Discord turns, fetch the real
+  // tool list from OpenClaw and remove mcp__openclaw__message so Claude can't
+  // call it (proxy handles all delivery).  Falls back to the wildcard from argv
+  // if the fetch fails, keeping the turn alive even if tools/list is slow.
+  let effectiveAllowedTools = allowedTools;
+  if (channelTarget && openClawEndpoint) {
+    const toolNames = await fetchOpenClawToolNames(openClawEndpoint);
+    if (toolNames) {
+      effectiveAllowedTools = toolNames.filter(t => t !== "mcp__openclaw__message");
+      log(`INFO tools: Discord turn — removed mcp__openclaw__message → [${effectiveAllowedTools.join(", ")}]`);
+    } else {
+      log("WARN tools: tools/list failed — keeping wildcard allowedTools (mcp__openclaw__message visible)");
+    }
+  }
+
+  const combinedAppend = appendSystemPrompt || undefined;
 
   // Build options after stdin / session lookup so resumeId is final.
   const options = {
     pathToClaudeCodeExecutable: resolvedClaudePath,
 
-    allowedTools,
+    allowedTools: effectiveAllowedTools,
     settingSources: ["user"],
     env: subprocessEnv,
 
@@ -702,8 +787,10 @@ async function main() {
   };
 
   // Run the agent and stream all SDK messages to stdout as JSONL.
-  let emittedSessionId;  // captured from first system/init — saved after loop
-  let capturedMsgText;   // text sent via mcp__openclaw__message — for result fix
+  let emittedSessionId;    // captured from first system/init — saved after loop
+  let capturedMsgText;     // last text delivered to Discord — for result.result fix
+  let firstAssistantSeen = false; // whether proxy has seen any assistant message yet
+  let ackSent            = false; // whether a proxy-generated ack was sent this turn
 
   // ── Tool-use keepalive ────────────────────────────────────────────────────
   // OpenClaw's stdout reader can time out during long tool executions since the
@@ -731,9 +818,47 @@ async function main() {
   }
 
   for await (const message of query({ prompt, options })) {
-    // ── Capture Discord message text ─────────────────────────────────────────
-    // When Claude calls mcp__openclaw__message, capture the message text so we
-    // can inject it into result/success.output if it would otherwise be empty.
+    // ── Auto-deliver Claude's text to Discord ─────────────────────────────────
+    // The proxy intercepts every assistant text block and sends it to Discord
+    // directly via a fetch() to OpenClaw's MCP HTTP server.  Claude just writes
+    // normal responses — it has no channel awareness or delivery obligations.
+    //
+    // Auto-ack: if the very first assistant message contains only tool_use blocks
+    // (Claude went straight to work with no opening line), inject a proxy-generated
+    // ack so the user sees immediate activity.
+    if (message.type === "assistant" && channelTarget && openClawEndpoint) {
+      const content    = message.content ?? message.message?.content;
+      if (Array.isArray(content)) {
+        const textBlocks = content.filter(c => c?.type === "text" && c.text?.trim());
+        const hasTools   = content.some(c => c?.type === "tool_use");
+
+        if (!firstAssistantSeen && textBlocks.length === 0 && hasTools && !ackSent) {
+          const ackText = "⏳ On it...";
+          const ok = await deliverToChannel(openClawEndpoint, channelTarget, ackText);
+          if (ok) {
+            ackSent = true;
+            capturedMsgText = ackText;
+            log(`INFO proxy-ack: sent "${ackText}" to ${channelTarget}`);
+          } else {
+            log(`WARN proxy-ack: delivery failed for ${channelTarget}`);
+          }
+        }
+
+        for (const block of textBlocks) {
+          const ok = await deliverToChannel(openClawEndpoint, channelTarget, block.text);
+          if (ok) {
+            capturedMsgText = block.text;
+            log(`INFO auto-deliver: ${block.text.length} chars → ${channelTarget}: ${block.text.slice(0, 60).replace(/\n/g, "↵")}`);
+          } else {
+            log(`WARN auto-deliver: delivery failed for ${channelTarget}`);
+          }
+        }
+
+        firstAssistantSeen = true;
+      }
+    }
+
+    // ── Emit tool_use_start events + keepalive ────────────────────────────────
     if (message.type === "assistant") {
       const content = message.content ?? message.message?.content;
       if (Array.isArray(content)) {
@@ -748,27 +873,6 @@ async function main() {
             startToolKeepalive(tname);
           }
         }
-
-        const msgTool = content.find(
-          (c) => c?.type === "tool_use" && c?.name === "mcp__openclaw__message",
-        );
-        if (msgTool?.input) {
-          // Log full input so we can confirm the field name
-          log(`DIAG tool_input: ${JSON.stringify(msgTool.input).slice(0, 200)}`);
-          // Try common field names for the message text
-          capturedMsgText = msgTool.input.text ?? msgTool.input.content
-            ?? msgTool.input.message ?? msgTool.input.body ?? msgTool.input.msg;
-          if (!capturedMsgText && typeof msgTool.input === "object") {
-            // Scan all string values — skip action/target which are routing fields
-            for (const [k, v] of Object.entries(msgTool.input)) {
-              if (k !== "action" && k !== "target" && typeof v === "string" && v.length > 2) {
-                capturedMsgText = v;
-                log(`DIAG msg_text at key "${k}": ${v.slice(0, 80)}`);
-                break;
-              }
-            }
-          }
-        }
       }
     }
 
@@ -779,7 +883,6 @@ async function main() {
         for (const block of content) {
           if (block?.type === "tool_result") {
             const isErr = block.is_error === true;
-            // Log errors from tool calls so we can diagnose failed mcp__openclaw__message sends
             if (isErr) {
               const errText = Array.isArray(block.content)
                 ? block.content.map((c) => c?.text ?? "").join(" ").slice(0, 200)
