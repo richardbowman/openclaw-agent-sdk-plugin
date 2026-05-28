@@ -556,6 +556,17 @@ async function main() {
     // (confirmed via RAW_ARGV — always none).  Look up the last session for
     // this chat and resume it ourselves so Claude keeps context across turns.
     chatId = extractChatId(prompt);
+
+    // Voice assistant turns arrive as raw plain text with no Delivery: prefix
+    // and no embedded chat_id JSON block.  Detect them by exclusion: not a cron
+    // job (which start with "[cron:"), not a Discord/channel turn (which start
+    // with "Delivery:").  Assign a stable synthetic chat_id so voice gets the
+    // same persistent-session treatment as Discord channels.
+    if (!chatId && !prompt.startsWith("[cron:") && !prompt.startsWith("Delivery:")) {
+      chatId = "voice:ha-assist";
+      log(`INFO session: no chat_id in stdin — treating as voice turn, chatId=${chatId}`);
+    }
+
     if (!resumeId && chatId) {
       const storedSession = await loadChatSession(chatId);
       if (storedSession) {
