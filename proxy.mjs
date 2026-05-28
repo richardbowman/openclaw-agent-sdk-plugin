@@ -509,14 +509,27 @@ async function editChannelMessage(endpoint, channelId, messageId, fullText) {
     if (!res.ok) { log(`WARN editChannelMessage HTTP ${res.status}`); return false; }
     const data     = await res.json().catch(() => null);
     const respText = String(data?.result?.content?.[0]?.text ?? data?.result?.content ?? "");
-    log(`DIAG edit-response: ${respText.slice(0, 150)}`);
-    // "Unknown Message" = Discord 10008 — wrong message ID or message deleted.
-    // Treat any non-success response as failure so pushText falls back to send.
-    if (data?.result?.isError || /unknown|not found|error|invalid/i.test(respText)) {
-      log(`WARN editChannelMessage: rejected (${respText.slice(0, 60)}) — falling back to send`);
+    // OpenClaw returns { "ok": true, "message": { ... } } on success.
+    // Do NOT use a keyword regex — the response embeds the message content,
+    // which may legitimately contain words like "error" or "unknown".
+    if (data?.result?.isError) {
+      log(`WARN editChannelMessage: isError flag — ${respText.slice(0, 80)}`);
       return false;
     }
-    return true;
+    try {
+      const inner = JSON.parse(respText);
+      if (inner?.ok === true) {
+        log(`DIAG edit-response: ok=true`);
+        return true;
+      }
+      // Has an ok field but it's not true (e.g. "Unknown Message" → ok:false or error field)
+      log(`WARN editChannelMessage: ok!=true — ${respText.slice(0, 80)}`);
+      return false;
+    } catch {
+      // Response isn't JSON — uncertain, treat as failure
+      log(`WARN editChannelMessage: non-JSON response — ${respText.slice(0, 80)}`);
+      return false;
+    }
   } catch (err) {
     log(`WARN editChannelMessage: ${err?.message ?? String(err)}`);
     return false;
