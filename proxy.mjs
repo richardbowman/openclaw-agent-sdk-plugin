@@ -623,15 +623,31 @@ async function main() {
   // the chatId is already in "channel:ID" form; otherwise empty string.
   const channelTarget = chatId?.startsWith("channel:") ? chatId : "";
 
+  // Maximum agentic turns (assistant→tools→assistant cycles) for Discord channel
+  // turns.  Prevents runaway research sessions that exhaust OpenClaw's subprocess
+  // timeout (~6-7 min) and deliver nothing.  15 turns ≈ 15-45 tool calls for
+  // most patterns; generous enough for legitimate multi-step tasks but far below
+  // the 30+ spiral that caused the ce043e68 timeout.
+  const MAX_TURNS_DISCORD = 15;
+
   const proxySystemAddition = channelTarget
     ? [
         "",
-        "## Immediate Acknowledgment",
-        `When the user's request requires tool use or will take more than a moment`,
-        `to answer, call the message tool FIRST with a brief status before starting`,
-        `work. Use target="${channelTarget}" and a short message such as`,
-        `"⏳ On it..." or "🔍 Searching..." or "🛠️ Give me a moment...".`,
-        `Skip only when you can answer immediately without any tool calls.`,
+        "## Discord Response Requirements",
+        `You are operating as a Discord bot. The user ONLY sees messages you explicitly`,
+        `send via the message tool with target="${channelTarget}". Your final assistant`,
+        `text is NOT shown to the user — you must use mcp__openclaw__message for all`,
+        `response delivery.`,
+        "",
+        "**Workflow for every request:**",
+        `1. If the request requires tool use, send a brief acknowledgment first`,
+        `   (e.g. "⏳ On it..." or "🔍 Searching...") using target="${channelTarget}".`,
+        `2. Complete your work efficiently — aim for ~8 tool uses or fewer.`,
+        `3. ALWAYS finish by calling the message tool with your findings, even if`,
+        `   partial. A timely partial answer is far better than silence.`,
+        "",
+        `If you cannot finish within ~8 tool uses, send what you have found so far`,
+        `and stop. Do not attempt to gather more data when you are running long.`,
       ].join("\n")
     : "";
 
@@ -651,6 +667,9 @@ async function main() {
     ...(permissionMode    && { permissionMode }),
     ...(effort            && { effort }),
     ...(mcpServers        && { mcpServers }),
+    // Cap agentic turns for Discord channel turns to prevent runaway sessions
+    // being killed by OpenClaw's subprocess timeout with no response delivered.
+    ...(channelTarget     && { maxTurns: MAX_TURNS_DISCORD }),
     ...(combinedAppend && {
       systemPrompt: {
         type:   "preset",
@@ -804,10 +823,21 @@ async function main() {
     if (message.type === "result" && message.subtype === "success") {
       stopToolKeepalive(); // belt-and-suspenders — clear any lingering timer
       log(`DIAG result_msg: ${JSON.stringify(message).slice(0, 300)}`);
+      const stopReason = message.stop_reason ?? message.stopReason ?? "";
+      if (stopReason === "max_turns") {
+        log(`WARN result: max_turns hit — turn was capped at ${MAX_TURNS_DISCORD} agentic turns; Claude may not have finished`);
+      }
       const curOutput = message.result ?? message.output ?? "";
       if (!curOutput && capturedMsgText) {
         outgoing = { ...message, result: capturedMsgText };
         log(`INFO result-fix: set result.result="${capturedMsgText.slice(0, 60)}" to prevent empty_response fallback`);
+      } else if (!curOutput && stopReason === "max_turns") {
+        // Claude hit the turn cap without sending anything via the message tool.
+        // Inject a fallback so OpenClaw doesn't treat this as an empty response
+        // and fall back to GPT.  The user still won't see a Discord message here,
+        // but at least the session is preserved for their next turn.
+        outgoing = { ...message, result: "[Research limit reached — please ask me to continue]" };
+        log(`INFO result-fix: max_turns with no captured message — injecting fallback result`);
       }
     }
     if (outgoing !== message && message.type === "assistant") {
