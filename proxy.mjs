@@ -271,7 +271,8 @@ async function triggerAddonRestart() {
 // expire after SESSION_MAX_AGE_MS so stale sessions don't cause SDK errors.
 
 const CHAT_SESSIONS_FILE = "/config/claude-sdk-proxy/chat-sessions.json";
-const SESSION_MAX_AGE_MS = 4 * 60 * 60 * 1000; // 4 hours
+const SESSION_MAX_AGE_MS        = 4  * 60 * 60 * 1000; // 4 hours  (Discord channels)
+const SESSION_MAX_AGE_VOICE_MS  = 30 * 60 * 1000;      // 30 minutes (voice turns)
 
 /**
  * Extract the chat_id from OpenClaw's per-turn stdin prompt.
@@ -295,16 +296,19 @@ function extractChatId(promptStr) {
 
 /**
  * Return the stored session_id for chatId, or undefined if absent or expired.
+ * Voice sessions use a shorter TTL to prevent context accumulation across
+ * unrelated queries (e.g. weather → lights control hours later).
  */
 async function loadChatSession(chatId) {
   if (!chatId) return undefined;
   try {
-    const store = JSON.parse(await readFile(CHAT_SESSIONS_FILE, "utf8"));
-    const entry = store[chatId];
+    const store  = JSON.parse(await readFile(CHAT_SESSIONS_FILE, "utf8"));
+    const entry  = store[chatId];
     if (!entry?.sessionId) return undefined;
-    const ageMs = Date.now() - (entry.ts ?? 0);
-    if (ageMs > SESSION_MAX_AGE_MS) {
-      log(`INFO session: ${chatId} expired (age ${Math.round(ageMs / 60000)}min), starting fresh`);
+    const maxAge = chatId.startsWith("voice:") ? SESSION_MAX_AGE_VOICE_MS : SESSION_MAX_AGE_MS;
+    const ageMs  = Date.now() - (entry.ts ?? 0);
+    if (ageMs > maxAge) {
+      log(`INFO session: ${chatId} expired (age ${Math.round(ageMs / 60000)}min, max ${Math.round(maxAge / 60000)}min), starting fresh`);
       return undefined;
     }
     log(`INFO session: found ${chatId} → ${entry.sessionId} (age ${Math.round(ageMs / 60000)}min)`);
@@ -563,6 +567,16 @@ async function main() {
     // with "Delivery:").  Assign a stable synthetic chat_id so voice gets the
     // same persistent-session treatment as Discord channels.
     if (!chatId && !prompt.startsWith("[cron:") && !prompt.startsWith("Delivery:")) {
+      // Log the system prompt and MCP config so we can check whether OpenClaw
+      // hides any per-conversation identifier (e.g. HA conversation_id) in those
+      // files that we could use instead of the fallback "voice:ha-assist" key.
+      log(`DIAG voice sysprompt[0:500]: ${JSON.stringify((appendSystemPrompt ?? "").slice(0, 500))}`);
+      try {
+        const rawMcp = mcpConfigFile ? JSON.stringify(JSON.parse(await readFile(mcpConfigFile, "utf8")), null, 0) : "(none)";
+        log(`DIAG voice mcp[0:500]: ${rawMcp.slice(0, 500)}`);
+      } catch { log("DIAG voice mcp: (read failed)"); }
+      // Log OpenClaw env vars that might carry a per-conversation identifier
+      log(`DIAG voice env: AGENT_ID=${process.env.OPENCLAW_MCP_AGENT_ID ?? "(unset)"} CHANNEL=${process.env.OPENCLAW_MCP_MESSAGE_CHANNEL ?? "(unset)"} EVENT_KIND=${process.env.OPENCLAW_MCP_INBOUND_EVENT_KIND ?? "(unset)"} SESSION_KEY=${(process.env.OPENCLAW_MCP_SESSION_KEY ?? "(unset)").slice(0, 16)}`);
       chatId = "voice:ha-assist";
       log(`INFO session: no chat_id in stdin — treating as voice turn, chatId=${chatId}`);
     }
