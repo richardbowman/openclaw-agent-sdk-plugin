@@ -912,10 +912,33 @@ async function main() {
     await editChannelMessage(openClawEndpoint, channelTarget, activeMessageId, fullMsg(suffix));
   }
 
-  // SIGTERM handler — if OpenClaw kills the subprocess mid-turn, try to edit
-  // the active message with a "cut off" notice so the user knows what happened.
-  // Best-effort: localhost HTTP call should complete before SIGKILL arrives.
+  // ── Proxy-side turn timeout ────────────────────────────────────────────────
+  // OpenClaw kills the subprocess after ~7-8 minutes with SIGKILL (no SIGTERM),
+  // so the process dies silently with no way to send a cutoff message.
+  // Instead, we fire our OWN timeout at 4.5 minutes, edit the Discord message
+  // with a "reached my limit" notice, then break the loop and exit cleanly.
+  // This runs entirely inside the proxy with no dependency on OpenClaw signals.
+  let turnTimedOut = false;
+  const TURN_TIMEOUT_MS = channelTarget ? 4.5 * 60 * 1000 : 0;
+  const turnTimer = TURN_TIMEOUT_MS
+    ? setTimeout(async () => {
+        turnTimedOut = true;
+        log(`WARN turn-timeout: ${TURN_TIMEOUT_MS / 60_000} min limit reached — stopping turn`);
+        if (activeMessageId && channelTarget && openClawEndpoint && baseContent) {
+          try {
+            await editChannelMessage(
+              openClawEndpoint, channelTarget, activeMessageId,
+              baseContent + "\n\n_⏰ I've hit my research time limit. Reply to ask me to continue._",
+            );
+            log("INFO turn-timeout: edited message with cutoff notice");
+          } catch { /* best-effort */ }
+        }
+      }, TURN_TIMEOUT_MS)
+    : null;
+
+  // SIGTERM handler — belt-and-suspenders in case OpenClaw ever does send SIGTERM.
   const onSigterm = async () => {
+    if (turnTimer) clearTimeout(turnTimer);
     try {
       if (activeMessageId && channelTarget && openClawEndpoint && baseContent) {
         await editChannelMessage(
@@ -955,6 +978,9 @@ async function main() {
   }
 
   for await (const message of query({ prompt, options })) {
+    // Check proxy-side turn timeout — break cleanly before OpenClaw kills us.
+    if (turnTimedOut) { log("INFO turn-timeout: breaking message loop"); break; }
+
     // ── Auto-deliver Claude's text to Discord (edit-in-place) ────────────────
     // Every assistant text block is delivered immediately via pushText(), which
     // edits the existing Discord message in-place (growing it) rather than
@@ -1121,6 +1147,7 @@ async function main() {
   }
 
   stopToolKeepalive(); // ensure timer is cleared if loop exits early
+  if (turnTimer) clearTimeout(turnTimer); // cancel timeout — turn finished cleanly
   process.off("SIGTERM", onSigterm); // normal exit — no cutoff notice needed
 
   // Persist the session_id so the next per-turn message for this chat
