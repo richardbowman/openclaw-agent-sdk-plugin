@@ -577,7 +577,12 @@ async function main() {
       } catch { log("DIAG voice mcp: (read failed)"); }
       // Log OpenClaw env vars that might carry a per-conversation identifier
       log(`DIAG voice env: AGENT_ID=${process.env.OPENCLAW_MCP_AGENT_ID ?? "(unset)"} CHANNEL=${process.env.OPENCLAW_MCP_MESSAGE_CHANNEL ?? "(unset)"} EVENT_KIND=${process.env.OPENCLAW_MCP_INBOUND_EVENT_KIND ?? "(unset)"} SESSION_KEY=${(process.env.OPENCLAW_MCP_SESSION_KEY ?? "(unset)").slice(0, 16)}`);
-      chatId = "voice:ha-assist";
+      // Derive a stable key from OpenClaw's per-instance env vars.
+      // CHANNEL=voice, AGENT_ID=main — both are constant for the addon lifetime
+      // but would differ if a second voice agent or channel type were added.
+      const ocChannel = process.env.OPENCLAW_MCP_MESSAGE_CHANNEL || "voice";
+      const ocAgent   = process.env.OPENCLAW_MCP_AGENT_ID        || "main";
+      chatId = `${ocChannel}:${ocAgent}`;
       log(`INFO session: no chat_id in stdin — treating as voice turn, chatId=${chatId}`);
     }
 
