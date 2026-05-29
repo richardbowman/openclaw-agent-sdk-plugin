@@ -364,22 +364,30 @@ async function runChatCompletion(body, onChunk) {
         /compact/i.test(errMsg) ||
         (/404/.test(errMsg) && /mcp|session/i.test(errMsg));
 
-      if (isCompaction && !retried) {
-        log(`WARN compaction: clearing ${chatId} and retrying`);
+      // Stale session IDs (created by a previous CLI backend run or a different
+      // SDK version) cause "No conversation found with session ID: <uuid>".
+      // Treat these exactly like a compaction error: clear the cached ID and
+      // retry immediately with a fresh session so the user gets a real response.
+      const isStaleSession =
+        /no conversation found/i.test(errMsg) ||
+        /session.*not found|invalid.*session/i.test(errMsg);
+
+      if ((isCompaction || isStaleSession) && !retried) {
+        log(`WARN stale-or-compaction: clearing ${chatId} and retrying (staleSession=${isStaleSession}, compaction=${isCompaction})`);
         await deleteChatSession(chatId);
         fullText     = "";
         newSessionId = null;
         retried      = true;
-        // keepLooping stays true → retries
+        // keepLooping stays true → retries without resume
       } else {
         queryError  = err;
         keepLooping = false;
-        const friendly = isCompaction
+        const friendly = (isCompaction || isStaleSession)
           ? "My conversation history was reset. Please repeat your question."
           : "I ran into an error processing your request. Please try again.";
         fullText = friendly;
         if (onChunk) onChunk(friendly);
-        log(`INFO query-error: returning friendly message (isCompaction=${isCompaction}, retried=${retried})`);
+        log(`INFO query-error: returning friendly message (isCompaction=${isCompaction}, isStaleSession=${isStaleSession}, retried=${retried})`);
       }
     }
   }
