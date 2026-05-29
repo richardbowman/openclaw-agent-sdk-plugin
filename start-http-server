@@ -1,0 +1,16 @@
+#!/bin/sh
+# Launcher for http-server.mjs — called by OpenClaw localService.
+#
+# OpenClaw spawns this with stdio:ignore, so all output would be lost without
+# the redirect below.  We log to a file so the server's startup/request logs
+# are inspectable:
+#   ssh root@<HA-IP> "tail -f /addon_configs/17e0cc66_openclaw_assistant/claude-sdk-proxy/http-server.log"
+#
+# Note: exec replaces this shell with node, so the shell itself uses no memory
+# after the node process starts.  The final echo line is unreachable on success.
+LOG=/config/claude-sdk-proxy/http-server.log
+echo "[$(date)] start-http-server invoked, PATH=$PATH" >> $LOG
+which node >> $LOG 2>&1
+node --version >> $LOG 2>&1
+exec node /config/claude-sdk-proxy/http-server.mjs >> $LOG 2>&1
+echo "[$(date)] exec node failed (exit $?)" >> $LOG

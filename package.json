@@ -1,7 +1,7 @@
 {
   "name": "openclaw-agent-sdk-plugin",
-  "version": "2.0.0",
-  "description": "OpenClaw CliBackendPlugin that drives Claude Code via the Anthropic Agent SDK, enabling richer status events and stable multi-turn streaming.",
+  "version": "3.0.0",
+  "description": "OpenClaw plugin: Claude Agent SDK HTTP server + (dormant) CLI backend. Handles all channels via a persistent HTTP provider with session stitching, HA MCP, and OAuth auth.",
   "type": "module",
   "engines": {
     "node": ">=22"

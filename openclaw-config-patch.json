@@ -1,16 +1,56 @@
 {
   "_comment": [
-    "The only openclaw.json change needed after installing the plugin.",
-    "Set agents.defaults.model to the new backend ID + model name.",
-    "The backend ID is 'claude-agent-sdk' (registered by index.mjs).",
-    "Replace 'claude-sonnet-4-6' with whichever model you have access to.",
+    "Required openclaw.json additions after installing this plugin.",
     "",
-    "There is no longer a cliBackends override required — the plugin declares",
-    "command, args, resumeArgs, and all CliBackendConfig fields itself."
+    "1. models.providers — registers 'claude-agent-sdk' as an HTTP provider.",
+    "   OpenClaw routes all agent requests to the local http-server (port 18791).",
+    "   localService auto-starts start-http-server when the first request arrives.",
+    "",
+    "2. agents.defaults.model — set all agents to use the HTTP provider.",
+    "   Replace 'claude-sonnet-4-6' with whichever model you have access to.",
+    "",
+    "The CLI backend (registerCliBackend in index.mjs) is intentionally disabled.",
+    "All channels (Discord, voice, webchat, cron) go through the HTTP provider."
   ],
+  "models": {
+    "providers": {
+      "claude-agent-sdk": {
+        "models": [
+          {
+            "id": "claude-haiku-4-5",
+            "name": "Claude Haiku 4.5",
+            "reasoning": false,
+            "input": ["text", "image"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 200000,
+            "maxTokens": 8192
+          },
+          {
+            "id": "claude-sonnet-4-6",
+            "name": "Claude Sonnet 4.6",
+            "reasoning": false,
+            "input": ["text", "image"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 200000,
+            "maxTokens": 64000
+          }
+        ],
+        "baseUrl": "http://127.0.0.1:18791",
+        "authHeader": false,
+        "apiKey": "not-used",
+        "localService": {
+          "command": "/config/claude-sdk-proxy/start-http-server",
+          "healthUrl": "http://127.0.0.1:18791/health",
+          "readyTimeoutMs": 30000
+        }
+      }
+    }
+  },
   "agents": {
     "defaults": {
-      "model": "claude-agent-sdk/claude-sonnet-4-6"
+      "model": {
+        "primary": "claude-agent-sdk/claude-sonnet-4-6"
+      }
     }
   }
 }
