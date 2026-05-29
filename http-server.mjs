@@ -43,9 +43,11 @@ const SESSION_MAX_AGE_SHORT_MS = 30 * 60 * 1000;        // 30 min – voice
 
 function log(msg) {
   try {
-    const line = `[http-server] ${new Date().toISOString()} ${msg}\n`;
-    process.stderr.write(line);
-    appendFileSync(LOG_FILE, line);
+    // Write only to the file via appendFileSync.
+    // start-http-server uses "exec node ... >> $LOG 2>&1" which would double-write
+    // if we also did process.stderr.write().  Any uncaught errors still reach the
+    // file via the shell's stderr redirect.
+    appendFileSync(LOG_FILE, `[http-server] ${new Date().toISOString()} ${msg}\n`);
   } catch { /* ignore write errors */ }
 }
 
