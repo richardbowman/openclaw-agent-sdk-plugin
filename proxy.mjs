@@ -337,6 +337,30 @@ async function saveChatSession(chatId, sessionId) {
   }
 }
 
+/**
+ * Remove chatId from the sessions store.  Called when a compaction error
+ * is detected so the next turn starts a fresh session instead of trying
+ * to resume a context that can no longer be hydrated.  Atomic write via .tmp rename.
+ */
+async function deleteChatSession(chatId) {
+  if (!chatId) return;
+  try {
+    let store = {};
+    try { store = JSON.parse(await readFile(CHAT_SESSIONS_FILE, "utf8")); } catch {}
+    if (!(chatId in store)) {
+      log(`INFO session: delete ${chatId} — not present, nothing to remove`);
+      return;
+    }
+    delete store[chatId];
+    const tmp = CHAT_SESSIONS_FILE + ".tmp";
+    await writeFile(tmp, JSON.stringify(store, null, 2) + "\n", "utf8");
+    await rename(tmp, CHAT_SESSIONS_FILE);
+    log(`INFO session: deleted ${chatId} from chat-sessions.json`);
+  } catch (err) {
+    log(`WARN session: could not delete ${chatId}: ${err?.message ?? String(err)}`);
+  }
+}
+
 // ─── Assistant message enrichment ────────────────────────────────────────────
 //
 // OpenClaw labels a cli-backend response "empty" when the assistant message
@@ -672,6 +696,19 @@ async function main() {
   // flow itself.
   const subprocessEnv = {
     ...process.env,
+    // Do NOT set CLAUDE_CONFIG_DIR unconditionally.  OpenClaw's addon process
+    // runs with HOME=/addon_configs/17e0cc66_openclaw_assistant/, so the claude
+    // subprocess (inheriting HOME via process.env) stores session .jsonl files
+    // in <HOME>/.claude/projects/.  OpenClaw's compaction reads from that same
+    // directory via resolveClaudeCliSessionFilePath().  Overriding CLAUDE_CONFIG_DIR
+    // to /config/.claude/ would redirect sessions to /config/.claude/projects/,
+    // which OpenClaw cannot find → every compaction attempt 404s.
+    //
+    // Exception: when the access token is EXPIRED, we cannot inject it directly
+    // (the claude binary ignores a stale CLAUDE_CODE_OAUTH_TOKEN even when
+    // CLAUDE_CODE_OAUTH_REFRESH_TOKEN is present).  Instead, point CLAUDE_CONFIG_DIR
+    // at the credentials file so the binary can read the refresh token and do
+    // the OAuth refresh itself.
     ...(!tokenExpired && oauthToken   && { CLAUDE_CODE_OAUTH_TOKEN:         oauthToken }),
     ...(!tokenExpired && refreshToken && { CLAUDE_CODE_OAUTH_REFRESH_TOKEN: refreshToken }),
     ...(tokenExpired                  && { CLAUDE_CONFIG_DIR: "/config/.claude" }),
@@ -977,7 +1014,32 @@ async function main() {
     activeToolName = null;
   }
 
-  for await (const message of query({ prompt, options })) {
+  // ── SDK error / session-resume guard ─────────────────────────────────────
+  // The Agent SDK auto-compacts long sessions transparently during an active
+  // turn (emitting a compact_boundary system event) — this is the expected
+  // mechanism for CLI backends.  However, if a session cannot be resumed
+  // (stale session_id, corrupt session file, unexpected SDK error), the SDK
+  // throws before any messages are emitted.  That error would propagate to
+  // main().catch → process.exit(1), causing OpenClaw to TTS the raw error.
+  //
+  // Safety net: catch any SDK throw from the query loop.  On the first error
+  // in per-turn mode, clear the cached session and retry immediately with a
+  // fresh session so this turn still completes.  Emit a friendly result on
+  // unrecoverable errors so OpenClaw/voice TTS says something clean.
+  let queryError   = null;
+  let retried      = false;
+  let keepLooping  = true;
+
+  while (keepLooping) {
+  // On the retry pass, drop the resume option so the SDK starts a fresh
+  // session (the stale one was already cleared from chat-sessions.json).
+  const runOptions = retried
+    ? (({ resume: _r, ...rest }) => rest)(options)
+    : options;
+
+  try {
+
+  for await (const message of query({ prompt, options: runOptions })) {
     // Check proxy-side turn timeout — break cleanly before OpenClaw kills us.
     if (turnTimedOut) { log("INFO turn-timeout: breaking message loop"); break; }
 
@@ -1146,6 +1208,54 @@ async function main() {
     }
   }
 
+  keepLooping = false; // for-await completed successfully — exit the while loop
+
+  } catch (err) {
+    // ── SDK error / compaction-retry handler ────────────────────────────────
+    const errMsg = err?.message ?? String(err);
+    log(`WARN query-loop threw: ${errMsg.slice(0, 300)}`);
+
+    // Classify: is this a compaction / stale-MCP-port error?
+    // Compaction errors look like: "404 ... /mcp" or "compaction failed" or
+    // "error 404 from openclaw".  We cast a reasonably wide net.
+    const isCompaction =
+      /compact/i.test(errMsg) ||
+      (/404/.test(errMsg) && /mcp|openclaw|session/i.test(errMsg));
+
+    // On the first compaction error in per-turn mode: clear the stale session
+    // and retry immediately with a fresh session so this turn completes
+    // successfully — the user gets their answer without having to repeat
+    // themselves.  keepLooping stays true so the while loop re-enters.
+    if (isCompaction && !isLiveSession && !retried) {
+      log(`WARN compaction: clearing session ${chatId ?? "(unknown)"}, retrying turn without resume`);
+      await deleteChatSession(chatId);
+      retried            = true;
+      emittedSessionId   = undefined;     // fresh session will have a new id
+      firstAssistantSeen = false;         // allow auto-ack to re-fire if needed
+      ackSent            = !!baseContent; // preserve ack state if Discord already got content
+      toolCallCount      = 0;
+      textSinceToolCount = 0;
+      // keepLooping stays true — the while loop will retry immediately
+    } else {
+      // Non-compaction error, already retried once, or live-session mode —
+      // emit a friendly result so OpenClaw/voice TTS's something clean.
+      queryError  = err;
+      keepLooping = false;
+      const friendlyMsg = isCompaction
+        ? "My conversation history was reset. Please repeat your question."
+        : "I ran into an error processing your request. Please try again.";
+      emit({
+        type:       "result",
+        subtype:    "success",
+        result:     friendlyMsg,
+        session_id: emittedSessionId ?? "",
+      });
+      log(`INFO query-error: emitted friendly result (isCompaction=${isCompaction}, retried=${retried})`);
+    }
+  }
+  } // end while (keepLooping)
+
+  // ── Post-loop cleanup (runs on both clean exit and error path) ────────────
   stopToolKeepalive(); // ensure timer is cleared if loop exits early
   if (turnTimer) clearTimeout(turnTimer); // cancel timeout — turn finished cleanly
   process.off("SIGTERM", onSigterm); // normal exit — no cutoff notice needed
@@ -1153,7 +1263,13 @@ async function main() {
   // Persist the session_id so the next per-turn message for this chat
   // can resume it (self-managed continuity, bypassing openclaw's broken
   // sessionIdFields tracking).
-  if (!isLiveSession && chatId && emittedSessionId) {
+  //   - Clean exit:          saves current session
+  //   - Compaction + retry:  saves the NEW session from the retry (emittedSessionId
+  //                          was reset in the retry setup, then re-captured from the
+  //                          fresh system/init event)
+  //   - Unrecoverable error: queryError is set, so we skip — session was deleted
+  //                          (compaction) or may be in an unknown state
+  if (!isLiveSession && chatId && emittedSessionId && !queryError) {
     await saveChatSession(chatId, emittedSessionId);
   }
 
