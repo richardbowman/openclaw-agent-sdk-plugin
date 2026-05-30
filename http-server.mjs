@@ -222,22 +222,28 @@ async function deleteChatSession(chatId) {
 /**
  * Derive a stable conversation key from an OpenAI-format request body.
  *
+ * Returns { chatId, isolated } where isolated=true means the caller should
+ * skip session resumption and not persist the session after completion.
+ *
  * Priority:
  *  1. body.user field (OpenClaw sets this to the conversation ID when known)
- *  2. chat_id in a fenced JSON block inside any message content
- *  3. Short hash of the first 100 chars of the system message (stable per agent)
- *  4. "http:default"
+ *  2. chat_id in a fenced JSON block inside any message content (Discord)
+ *  3. [cron:<uuid>] prefix in the last user message — isolated, no resume
+ *  4. MD5 of the FULL system message (stable per agent; full hash distinguishes
+ *     ha-voice from main-agent when they diverge after the shared preamble)
+ *  5. "http:default"
  */
 function deriveChatId(body) {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+
   // 1. user field
   if (body.user && typeof body.user === "string" && body.user.trim()) {
     const key = `user:${body.user.trim()}`;
     log(`DIAG chatId: from body.user → ${key}`);
-    return key;
+    return { chatId: key, isolated: false };
   }
 
-  // 2. Scan message content for embedded chat_id JSON block (CLI backend format)
-  const messages = Array.isArray(body.messages) ? body.messages : [];
+  // 2. Scan message content for embedded chat_id JSON block (Discord)
   for (const msg of messages) {
     const raw = typeof msg.content === "string" ? msg.content
       : Array.isArray(msg.content)
@@ -249,29 +255,44 @@ function deriveChatId(body) {
         const chatId = JSON.parse(m[1])?.chat_id;
         if (chatId && typeof chatId === "string") {
           log(`DIAG chatId: from embedded JSON block → ${chatId}`);
-          return chatId;
+          return { chatId, isolated: false };
         }
       } catch {}
     }
   }
 
-  // 3. Hash first 100 chars of system message (stable per agent/config)
+  // 3. OpenClaw cron-job tag in the last user message.
+  //    OpenClaw prepends "[cron:<uuid> <name>]" to every agentTurn cron payload.
+  //    Cron jobs with sessionTarget="isolated" should never resume — treat all
+  //    cron requests as isolated so each run gets a clean context.
+  const lastUserMsg = messages.filter(m => m.role === "user").at(-1);
+  const lastUserTxt = lastUserMsg ? extractText(lastUserMsg.content) : "";
+  const cronMatch   = lastUserTxt.match(/^\[cron:([0-9a-f-]{36})[^\]]*\]/i);
+  if (cronMatch) {
+    const key = `cron:${cronMatch[1]}`;
+    log(`DIAG chatId: from cron prefix → ${key} (isolated)`);
+    return { chatId: key, isolated: true };
+  }
+
+  // 4. Hash the FULL system message.
+  //    Using the full content (vs just 100 chars) ensures agents that share a
+  //    common preamble but differ in their identity/tool sections get distinct keys.
   const sysMsg = messages.find(m => m.role === "system");
   if (sysMsg?.content) {
-    const txt  = typeof sysMsg.content === "string" ? sysMsg.content
+    const txt = typeof sysMsg.content === "string" ? sysMsg.content
       : Array.isArray(sysMsg.content)
         ? sysMsg.content.filter(c => c?.type === "text").map(c => c.text ?? "").join("")
         : "";
     if (txt) {
-      const hash = createHash("md5").update(txt.slice(0, 100)).digest("hex").slice(0, 8);
+      const hash = createHash("md5").update(txt).digest("hex").slice(0, 8);
       const key  = `http:${hash}`;
-      log(`DIAG chatId: from system-prompt hash → ${key}`);
-      return key;
+      log(`DIAG chatId: from full system-prompt hash (len=${txt.length}) → ${key}`);
+      return { chatId: key, isolated: false };
     }
   }
 
   log("DIAG chatId: fallback → http:default");
-  return "http:default";
+  return { chatId: "http:default", isolated: false };
 }
 
 // ── Extract text from OpenAI content field ────────────────────────────────────
@@ -300,8 +321,9 @@ async function runChatCompletion(body, onChunk) {
   const promptText     = extractText(lastUser.content);
   const systemPromptTxt = sysMsg ? extractText(sysMsg.content) : undefined;
 
-  const chatId   = deriveChatId(body);
-  const resumeId = await loadChatSession(chatId);
+  const { chatId, isolated } = deriveChatId(body);
+  // Isolated sessions (cron agentTurn jobs) never resume — each run is fresh.
+  const resumeId = isolated ? undefined : await loadChatSession(chatId);
 
   // Strip provider prefix from model name: "claude-agent-sdk/claude-haiku-4-5" → "claude-haiku-4-5"
   const rawModel = body.model ?? "claude-haiku-4-5";
@@ -426,9 +448,11 @@ async function runChatCompletion(body, onChunk) {
     }
   }
 
-  // Persist session (skip on error so we don't save a broken session)
-  if (chatId && newSessionId && !queryError) {
+  // Persist session — skip for isolated cron runs and on error.
+  if (!isolated && chatId && newSessionId && !queryError) {
     await saveChatSession(chatId, newSessionId);
+  } else if (isolated) {
+    log(`INFO session: isolated run, not saving ${chatId}`);
   }
 
   return { text: fullText || "(no response)", model: body.model ?? model };
@@ -490,6 +514,8 @@ const server = createServer(async (req, res) => {
     const created    = Math.floor(Date.now() / 1000);
 
     log(`DIAG body: model=${body.model} msgs=${body.messages?.length ?? 0} stream=${wantStream} user=${body.user ?? "(unset)"}`);
+
+
 
     if (wantStream) {
       // ── SSE streaming response ─────────────────────────────────────────────
