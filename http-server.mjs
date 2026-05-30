@@ -53,6 +53,40 @@ function log(msg) {
 
 log("http-server.mjs starting");
 
+// ── Process crash / signal handlers ──────────────────────────────────────────
+//
+// Without these, Node.js exits silently on uncaught exceptions and the log has
+// no record of why the process died.  SIGKILL (OOM) still leaves no trace, but
+// at least JS-level errors and SIGTERM/SIGINT are now visible.
+
+process.on("uncaughtException", (err) => {
+  log(`FATAL uncaughtException: ${err?.stack ?? err?.message ?? String(err)}`);
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  log(`FATAL unhandledRejection: ${reason?.stack ?? reason?.message ?? String(reason)}`);
+  process.exit(1);
+});
+
+process.on("SIGTERM", () => {
+  log("INFO signal: SIGTERM received — shutting down");
+  process.exit(0);
+});
+
+process.on("SIGINT", () => {
+  log("INFO signal: SIGINT received — shutting down");
+  process.exit(0);
+});
+
+// Periodic memory diagnostic — logs heap/rss every 5 minutes so we can spot
+// memory creep in the log before the container OOM killer fires silently.
+setInterval(() => {
+  const m   = process.memoryUsage();
+  const mb  = (n) => Math.round(n / 1024 / 1024);
+  log(`DIAG mem: rss=${mb(m.rss)}MB heap=${mb(m.heapUsed)}/${mb(m.heapTotal)}MB ext=${mb(m.external)}MB`);
+}, 5 * 60 * 1000).unref();   // unref() so the timer doesn't prevent clean exit
+
 // ── Claude binary resolution ──────────────────────────────────────────────────
 
 function resolveClaudePath() {

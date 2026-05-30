@@ -12,5 +12,8 @@ LOG=/config/claude-sdk-proxy/http-server.log
 echo "[$(date)] start-http-server invoked, PATH=$PATH" >> $LOG
 which node >> $LOG 2>&1
 node --version >> $LOG 2>&1
-exec node /config/claude-sdk-proxy/http-server.mjs >> $LOG 2>&1
+# --max-old-space-size caps the V8 heap so Node throws a catchable JS heap
+# error before the container OOM killer fires (which is silent / SIGKILL).
+# 512 MB is comfortable for normal use; bump if you see heap-limit errors.
+exec node --max-old-space-size=512 /config/claude-sdk-proxy/http-server.mjs >> $LOG 2>&1
 echo "[$(date)] exec node failed (exit $?)" >> $LOG
