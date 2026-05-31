@@ -171,7 +171,14 @@ export default definePluginEntry({
   name: "Claude Agent SDK",
   description:
     "Claude Code via the Anthropic Agent SDK — richer status events and stable multi-turn streaming",
-  register(api) {
-    api.registerCliBackend(buildBackend());
+  register(_api) {
+    // CLI backend intentionally not registered.
+    // All channels (Discord, voice, webchat) are now served by the HTTP server
+    // at http://127.0.0.1:18791 via the models.providers["claude-agent-sdk"]
+    // config in openclaw.json.  buildBackend() is preserved above for reference
+    // and possible future re-activation.
+    //
+    // To re-enable the CLI backend path, replace the body with:
+    //   api.registerCliBackend(buildBackend());
   },
 });

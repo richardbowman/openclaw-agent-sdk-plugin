@@ -337,6 +337,30 @@ async function saveChatSession(chatId, sessionId) {
   }
 }
 
+/**
+ * Remove chatId from the sessions store.  Called when a compaction error
+ * is detected so the next turn starts a fresh session instead of trying
+ * to resume a context that can no longer be hydrated.  Atomic write via .tmp rename.
+ */
+async function deleteChatSession(chatId) {
+  if (!chatId) return;
+  try {
+    let store = {};
+    try { store = JSON.parse(await readFile(CHAT_SESSIONS_FILE, "utf8")); } catch {}
+    if (!(chatId in store)) {
+      log(`INFO session: delete ${chatId} — not present, nothing to remove`);
+      return;
+    }
+    delete store[chatId];
+    const tmp = CHAT_SESSIONS_FILE + ".tmp";
+    await writeFile(tmp, JSON.stringify(store, null, 2) + "\n", "utf8");
+    await rename(tmp, CHAT_SESSIONS_FILE);
+    log(`INFO session: deleted ${chatId} from chat-sessions.json`);
+  } catch (err) {
+    log(`WARN session: could not delete ${chatId}: ${err?.message ?? String(err)}`);
+  }
+}
+
 // ─── Assistant message enrichment ────────────────────────────────────────────
 //
 // OpenClaw labels a cli-backend response "empty" when the assistant message
@@ -372,6 +396,168 @@ function enrichAssistantMessage(message) {
     return { ...message, message: { ...message.message, content: enriched } };
   }
   return { ...message, content: enriched };
+}
+
+// ─── OpenClaw HTTP endpoint helpers ───────────────────────────────────────────
+//
+// OpenClaw's MCP server is HTTP-based (url: "http://127.0.0.1:<port>/mcp").
+// We can call it directly from the proxy with fetch() — no Claude involvement.
+// This lets us intercept Claude's text output and route it to Discord ourselves,
+// keeping the model completely unaware of channels, tool names, or delivery.
+
+/**
+ * Parse the MCP config file written by OpenClaw and return { url, headers }
+ * with ${ENV_VAR} placeholders expanded from process.env.
+ * Returns null if absent, not HTTP-based, or unreadable.
+ */
+async function loadOpenClawEndpoint(cfgPath) {
+  if (!cfgPath) return null;
+  try {
+    const raw     = JSON.parse(await readFile(cfgPath, "utf8"));
+    const servers = raw.mcpServers ?? {};
+    const server  = servers.openclaw ?? Object.values(servers)[0];
+    if (!server?.url) { log("WARN loadOpenClawEndpoint: no url in mcp config"); return null; }
+    const expand  = (s) => String(s).replace(/\$\{([^}]+)\}/g, (_, k) => process.env[k] ?? "");
+    const url     = expand(server.url);
+    const headers = {};
+    for (const [k, v] of Object.entries(server.headers ?? {})) headers[k] = expand(v);
+    log(`INFO openclaw-endpoint: ${url}`);
+    return { url, headers };
+  } catch (err) {
+    log(`WARN loadOpenClawEndpoint: ${err?.message ?? String(err)}`);
+    return null;
+  }
+}
+
+/**
+ * List tools from OpenClaw's MCP server and return them in Claude Code's
+ * mcp__openclaw__<name> format.  Returns null on any failure.
+ */
+async function fetchOpenClawToolNames(endpoint) {
+  if (!endpoint) return null;
+  try {
+    const res = await fetch(endpoint.url, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", ...endpoint.headers },
+      body:    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      signal:  AbortSignal.timeout(5_000),
+    });
+    if (!res.ok) { log(`WARN fetchOpenClawToolNames HTTP ${res.status}`); return null; }
+    const data  = await res.json();
+    const tools = data?.result?.tools ?? [];
+    const names = tools.map(t => `mcp__openclaw__${t.name}`);
+    log(`INFO openclaw-tools: [${names.join(", ")}]`);
+    return names;
+  } catch (err) {
+    log(`WARN fetchOpenClawToolNames: ${err?.message ?? String(err)}`);
+    return null;
+  }
+}
+
+/**
+ * Send a new message to a Discord channel via OpenClaw's MCP server.
+ * Returns { ok: boolean, messageId: string|null } — messageId is parsed from
+ * the tool response if OpenClaw includes the Discord snowflake (17-19 digits).
+ */
+async function deliverToChannel(endpoint, channelId, text) {
+  if (!endpoint || !channelId || !text?.trim()) return { ok: false, messageId: null };
+  try {
+    const res = await fetch(endpoint.url, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", ...endpoint.headers },
+      body:    JSON.stringify({
+        jsonrpc: "2.0",
+        id:      Date.now(),
+        method:  "tools/call",
+        params:  { name: "message", arguments: { action: "send", target: channelId, message: text.trim() } },
+      }),
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      log(`WARN deliverToChannel HTTP ${res.status}: ${body.slice(0, 120)}`);
+      return { ok: false, messageId: null };
+    }
+    const data     = await res.json().catch(() => null);
+    const respText = String(data?.result?.content?.[0]?.text ?? data?.result?.content ?? "");
+    log(`DIAG deliver-response: ${respText.slice(0, 300)}`);
+    // OpenClaw returns its own envelope, not a raw Discord message object:
+    //   { channel, to, result: { receipt: {
+    //       primaryPlatformMessageId: "1509...",
+    //       platformMessageIds: ["1509..."],
+    //       ...
+    //   } } }
+    let messageId = null;
+    try {
+      const parsed  = JSON.parse(respText);
+      const receipt = parsed?.result?.receipt;
+      const raw     = receipt?.primaryPlatformMessageId
+                   ?? receipt?.platformMessageIds?.[0]
+                   // fallback paths in case OpenClaw changes shape
+                   ?? parsed?.id ?? parsed?.message_id ?? parsed?.messageId;
+      if (raw && /^\d{17,19}$/.test(String(raw))) messageId = String(raw);
+    } catch { /* not JSON — no safe regex fallback, leave null */ }
+    log(`DIAG deliver-messageId: ${messageId ?? "(none)"}`);
+    return { ok: true, messageId };
+  } catch (err) {
+    log(`WARN deliverToChannel: ${err?.message ?? String(err)}`);
+    return { ok: false, messageId: null };
+  }
+}
+
+/**
+ * Edit an existing Discord message in-place via OpenClaw's MCP server.
+ * Tries action:"edit" with the message_id — returns true if the server accepted
+ * it, false if edit isn't supported or the call failed.
+ */
+async function editChannelMessage(endpoint, channelId, messageId, fullText) {
+  if (!endpoint || !channelId || !messageId || !fullText?.trim()) return false;
+  try {
+    const res = await fetch(endpoint.url, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", ...endpoint.headers },
+      body:    JSON.stringify({
+        jsonrpc: "2.0",
+        id:      Date.now(),
+        method:  "tools/call",
+        params:  {
+          name:      "message",
+          // Try both snake_case and camelCase for the message ID field name —
+          // the winning variant will be clear from DIAG edit-response in the log.
+          arguments: { action: "edit", target: channelId,
+                       message_id: messageId, messageId, message: fullText.trim() },
+        },
+      }),
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!res.ok) { log(`WARN editChannelMessage HTTP ${res.status}`); return false; }
+    const data     = await res.json().catch(() => null);
+    const respText = String(data?.result?.content?.[0]?.text ?? data?.result?.content ?? "");
+    // OpenClaw returns { "ok": true, "message": { ... } } on success.
+    // Do NOT use a keyword regex — the response embeds the message content,
+    // which may legitimately contain words like "error" or "unknown".
+    if (data?.result?.isError) {
+      log(`WARN editChannelMessage: isError flag — ${respText.slice(0, 80)}`);
+      return false;
+    }
+    try {
+      const inner = JSON.parse(respText);
+      if (inner?.ok === true) {
+        log(`DIAG edit-response: ok=true`);
+        return true;
+      }
+      // Has an ok field but it's not true (e.g. "Unknown Message" → ok:false or error field)
+      log(`WARN editChannelMessage: ok!=true — ${respText.slice(0, 80)}`);
+      return false;
+    } catch {
+      // Response isn't JSON — uncertain, treat as failure
+      log(`WARN editChannelMessage: non-JSON response — ${respText.slice(0, 80)}`);
+      return false;
+    }
+  } catch (err) {
+    log(`WARN editChannelMessage: ${err?.message ?? String(err)}`);
+    return false;
+  }
 }
 
 // ─── Live-session stdin -> async generator ────────────────────────────────────
@@ -510,6 +696,19 @@ async function main() {
   // flow itself.
   const subprocessEnv = {
     ...process.env,
+    // Do NOT set CLAUDE_CONFIG_DIR unconditionally.  OpenClaw's addon process
+    // runs with HOME=/addon_configs/17e0cc66_openclaw_assistant/, so the claude
+    // subprocess (inheriting HOME via process.env) stores session .jsonl files
+    // in <HOME>/.claude/projects/.  OpenClaw's compaction reads from that same
+    // directory via resolveClaudeCliSessionFilePath().  Overriding CLAUDE_CONFIG_DIR
+    // to /config/.claude/ would redirect sessions to /config/.claude/projects/,
+    // which OpenClaw cannot find → every compaction attempt 404s.
+    //
+    // Exception: when the access token is EXPIRED, we cannot inject it directly
+    // (the claude binary ignores a stale CLAUDE_CODE_OAUTH_TOKEN even when
+    // CLAUDE_CODE_OAUTH_REFRESH_TOKEN is present).  Instead, point CLAUDE_CONFIG_DIR
+    // at the credentials file so the binary can read the refresh token and do
+    // the OAuth refresh itself.
     ...(!tokenExpired && oauthToken   && { CLAUDE_CODE_OAUTH_TOKEN:         oauthToken }),
     ...(!tokenExpired && refreshToken && { CLAUDE_CODE_OAUTH_REFRESH_TOKEN: refreshToken }),
     ...(tokenExpired                  && { CLAUDE_CONFIG_DIR: "/config/.claude" }),
@@ -623,26 +822,33 @@ async function main() {
   // the chatId is already in "channel:ID" form; otherwise empty string.
   const channelTarget = chatId?.startsWith("channel:") ? chatId : "";
 
-  const proxySystemAddition = channelTarget
-    ? [
-        "",
-        "## Immediate Acknowledgment",
-        `When the user's request requires tool use or will take more than a moment`,
-        `to answer, call the message tool FIRST with a brief status before starting`,
-        `work. Use target="${channelTarget}" and a short message such as`,
-        `"⏳ On it..." or "🔍 Searching..." or "🛠️ Give me a moment...".`,
-        `Skip only when you can answer immediately without any tool calls.`,
-      ].join("\n")
-    : "";
+  // ── OpenClaw endpoint + tool list (Discord turns only) ─────────────────────
+  // The proxy auto-delivers Claude's text output to Discord directly — Claude
+  // never sees mcp__openclaw__message and needs no channel-routing knowledge.
+  const openClawEndpoint = channelTarget ? await loadOpenClawEndpoint(mcpConfigFile) : null;
 
-  const combinedAppend = [appendSystemPrompt, proxySystemAddition]
-    .filter(Boolean).join("\n");
+  // Build the effective allowed-tools list.  For Discord turns, fetch the real
+  // tool list from OpenClaw and remove mcp__openclaw__message so Claude can't
+  // call it (proxy handles all delivery).  Falls back to the wildcard from argv
+  // if the fetch fails, keeping the turn alive even if tools/list is slow.
+  let effectiveAllowedTools = allowedTools;
+  if (channelTarget && openClawEndpoint) {
+    const toolNames = await fetchOpenClawToolNames(openClawEndpoint);
+    if (toolNames) {
+      effectiveAllowedTools = toolNames.filter(t => t !== "mcp__openclaw__message");
+      log(`INFO tools: Discord turn — removed mcp__openclaw__message → [${effectiveAllowedTools.join(", ")}]`);
+    } else {
+      log("WARN tools: tools/list failed — keeping wildcard allowedTools (mcp__openclaw__message visible)");
+    }
+  }
+
+  const combinedAppend = appendSystemPrompt || undefined;
 
   // Build options after stdin / session lookup so resumeId is final.
   const options = {
     pathToClaudeCodeExecutable: resolvedClaudePath,
 
-    allowedTools,
+    allowedTools: effectiveAllowedTools,
     settingSources: ["user"],
     env: subprocessEnv,
 
@@ -693,8 +899,95 @@ async function main() {
   };
 
   // Run the agent and stream all SDK messages to stdout as JSONL.
-  let emittedSessionId;  // captured from first system/init — saved after loop
-  let capturedMsgText;   // text sent via mcp__openclaw__message — for result fix
+  let emittedSessionId;    // captured from first system/init — saved after loop
+  let capturedMsgText;     // last text delivered to Discord — for result.result fix
+  let firstAssistantSeen = false; // whether proxy has seen any assistant message yet
+  let ackSent            = false; // whether a proxy-generated ack was sent this turn
+
+  // ── Edit-in-place Discord message state ────────────────────────────────────
+  // Instead of sending many separate Discord messages, we maintain one active
+  // message that grows as Claude narrates its work.  Tool status is appended as
+  // an ephemeral italic suffix (not included in baseContent) so it disappears
+  // naturally when the next text block arrives.
+  let activeMessageId    = null;  // Discord snowflake of the live message (if we got one)
+  let baseContent        = "";    // Accumulated delivered text (without tool-status suffix)
+  let toolCallCount      = 0;     // # of tool_use_end events this turn
+  let textSinceToolCount = 0;     // toolCallCount at last text delivery (for watchdog)
+
+  // Helper: compute the full message text to edit into Discord.
+  const fullMsg = (suffix = "") =>
+    suffix ? `${baseContent}\n\n${suffix}` : baseContent;
+
+  // Helper: deliver or update the Discord message with new text appended.
+  // Tries edit-in-place first (if we have a messageId); falls back to send.
+  async function pushText(text) {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const separator  = baseContent ? "\n" : "";
+    const newBase    = baseContent + separator + trimmed;
+    // Discord hard limit is 2000 chars — start a new message if we'd overflow.
+    if (activeMessageId && newBase.length <= 1900) {
+      const ok = await editChannelMessage(openClawEndpoint, channelTarget, activeMessageId, newBase);
+      if (ok) { baseContent = newBase; capturedMsgText = newBase; return; }
+      // Edit failed (tool doesn't support it, or message was deleted) — fall through.
+      activeMessageId = null;
+    }
+    const result = await deliverToChannel(openClawEndpoint, channelTarget,
+      // If accumulated too long, send only the new piece as a fresh message.
+      newBase.length <= 1900 ? newBase : trimmed);
+    if (result.ok) {
+      activeMessageId = result.messageId ?? null;
+      baseContent     = newBase.length <= 1900 ? newBase : trimmed;
+      capturedMsgText = baseContent;
+    }
+  }
+
+  // Helper: edit the current message to show a tool-status suffix without
+  // changing baseContent (the suffix is ephemeral; next pushText call removes it).
+  async function showToolStatus(suffix) {
+    if (!activeMessageId || !baseContent) return;
+    await editChannelMessage(openClawEndpoint, channelTarget, activeMessageId, fullMsg(suffix));
+  }
+
+  // ── Proxy-side turn timeout ────────────────────────────────────────────────
+  // OpenClaw kills the subprocess after ~7-8 minutes with SIGKILL (no SIGTERM),
+  // so the process dies silently with no way to send a cutoff message.
+  // Instead, we fire our OWN timeout at 4.5 minutes, edit the Discord message
+  // with a "reached my limit" notice, then break the loop and exit cleanly.
+  // This runs entirely inside the proxy with no dependency on OpenClaw signals.
+  let turnTimedOut = false;
+  const TURN_TIMEOUT_MS = channelTarget ? 4.5 * 60 * 1000 : 0;
+  const turnTimer = TURN_TIMEOUT_MS
+    ? setTimeout(async () => {
+        turnTimedOut = true;
+        log(`WARN turn-timeout: ${TURN_TIMEOUT_MS / 60_000} min limit reached — stopping turn`);
+        if (activeMessageId && channelTarget && openClawEndpoint && baseContent) {
+          try {
+            await editChannelMessage(
+              openClawEndpoint, channelTarget, activeMessageId,
+              baseContent + "\n\n_⏰ I've hit my research time limit. Reply to ask me to continue._",
+            );
+            log("INFO turn-timeout: edited message with cutoff notice");
+          } catch { /* best-effort */ }
+        }
+      }, TURN_TIMEOUT_MS)
+    : null;
+
+  // SIGTERM handler — belt-and-suspenders in case OpenClaw ever does send SIGTERM.
+  const onSigterm = async () => {
+    if (turnTimer) clearTimeout(turnTimer);
+    try {
+      if (activeMessageId && channelTarget && openClawEndpoint && baseContent) {
+        await editChannelMessage(
+          openClawEndpoint, channelTarget, activeMessageId,
+          baseContent + "\n\n_⚠️ Response was cut off — please ask me to continue._",
+        );
+        log("INFO sigterm: edited active message with cutoff notice");
+      }
+    } catch { /* best-effort */ }
+    process.exit(0);
+  };
+  process.once("SIGTERM", onSigterm);
 
   // ── Tool-use keepalive ────────────────────────────────────────────────────
   // OpenClaw's stdout reader can time out during long tool executions since the
@@ -721,10 +1014,81 @@ async function main() {
     activeToolName = null;
   }
 
-  for await (const message of query({ prompt, options })) {
-    // ── Capture Discord message text ─────────────────────────────────────────
-    // When Claude calls mcp__openclaw__message, capture the message text so we
-    // can inject it into result/success.output if it would otherwise be empty.
+  // ── SDK error / session-resume guard ─────────────────────────────────────
+  // The Agent SDK auto-compacts long sessions transparently during an active
+  // turn (emitting a compact_boundary system event) — this is the expected
+  // mechanism for CLI backends.  However, if a session cannot be resumed
+  // (stale session_id, corrupt session file, unexpected SDK error), the SDK
+  // throws before any messages are emitted.  That error would propagate to
+  // main().catch → process.exit(1), causing OpenClaw to TTS the raw error.
+  //
+  // Safety net: catch any SDK throw from the query loop.  On the first error
+  // in per-turn mode, clear the cached session and retry immediately with a
+  // fresh session so this turn still completes.  Emit a friendly result on
+  // unrecoverable errors so OpenClaw/voice TTS says something clean.
+  let queryError   = null;
+  let retried      = false;
+  let keepLooping  = true;
+
+  while (keepLooping) {
+  // On the retry pass, drop the resume option so the SDK starts a fresh
+  // session (the stale one was already cleared from chat-sessions.json).
+  const runOptions = retried
+    ? (({ resume: _r, ...rest }) => rest)(options)
+    : options;
+
+  try {
+
+  for await (const message of query({ prompt, options: runOptions })) {
+    // Check proxy-side turn timeout — break cleanly before OpenClaw kills us.
+    if (turnTimedOut) { log("INFO turn-timeout: breaking message loop"); break; }
+
+    // ── Auto-deliver Claude's text to Discord (edit-in-place) ────────────────
+    // Every assistant text block is delivered immediately via pushText(), which
+    // edits the existing Discord message in-place (growing it) rather than
+    // spamming new messages.  Tool status is shown as an ephemeral italic suffix.
+    //
+    // Auto-ack: if Claude's first move is pure tool-use with no opening text,
+    // the proxy injects "⏳ On it..." so the user sees activity immediately.
+    if (message.type === "assistant" && channelTarget && openClawEndpoint) {
+      const content    = message.content ?? message.message?.content;
+      if (Array.isArray(content)) {
+        const textBlocks = content.filter(c => c?.type === "text" && c.text?.trim());
+        const toolBlocks = content.filter(c => c?.type === "tool_use");
+
+        // Auto-ack on first pure-tool message (no text to deliver yet).
+        if (!firstAssistantSeen && textBlocks.length === 0 && toolBlocks.length > 0 && !ackSent) {
+          const result = await deliverToChannel(openClawEndpoint, channelTarget, "⏳ On it...");
+          if (result.ok) {
+            ackSent         = true;
+            activeMessageId = result.messageId ?? null;
+            baseContent     = "⏳ On it...";
+            capturedMsgText = baseContent;
+            log(`INFO proxy-ack: sent to ${channelTarget} (msgId=${activeMessageId ?? "none"})`);
+          } else {
+            log(`WARN proxy-ack: delivery failed for ${channelTarget}`);
+          }
+        }
+
+        // Deliver each text block — edit the existing message or send new.
+        for (const block of textBlocks) {
+          await pushText(block.text);
+          textSinceToolCount = toolCallCount;
+          log(`INFO auto-deliver: ${block.text.length} chars → ${channelTarget}: ${block.text.slice(0, 60).replace(/\n/g, "↵")}`);
+        }
+
+        // Show ephemeral tool-status suffix for the tools about to run.
+        if (toolBlocks.length > 0) {
+          const names  = toolBlocks.map(b => b.name ?? "tool").join(", ");
+          await showToolStatus(`_⚙️ ${names}…_`);
+          log(`INFO tool-status: ${names}`);
+        }
+
+        firstAssistantSeen = true;
+      }
+    }
+
+    // ── Emit tool_use_start events + keepalive ────────────────────────────────
     if (message.type === "assistant") {
       const content = message.content ?? message.message?.content;
       if (Array.isArray(content)) {
@@ -739,27 +1103,6 @@ async function main() {
             startToolKeepalive(tname);
           }
         }
-
-        const msgTool = content.find(
-          (c) => c?.type === "tool_use" && c?.name === "mcp__openclaw__message",
-        );
-        if (msgTool?.input) {
-          // Log full input so we can confirm the field name
-          log(`DIAG tool_input: ${JSON.stringify(msgTool.input).slice(0, 200)}`);
-          // Try common field names for the message text
-          capturedMsgText = msgTool.input.text ?? msgTool.input.content
-            ?? msgTool.input.message ?? msgTool.input.body ?? msgTool.input.msg;
-          if (!capturedMsgText && typeof msgTool.input === "object") {
-            // Scan all string values — skip action/target which are routing fields
-            for (const [k, v] of Object.entries(msgTool.input)) {
-              if (k !== "action" && k !== "target" && typeof v === "string" && v.length > 2) {
-                capturedMsgText = v;
-                log(`DIAG msg_text at key "${k}": ${v.slice(0, 80)}`);
-                break;
-              }
-            }
-          }
-        }
       }
     }
 
@@ -770,7 +1113,6 @@ async function main() {
         for (const block of content) {
           if (block?.type === "tool_result") {
             const isErr = block.is_error === true;
-            // Log errors from tool calls so we can diagnose failed mcp__openclaw__message sends
             if (isErr) {
               const errText = Array.isArray(block.content)
                 ? block.content.map((c) => c?.text ?? "").join(" ").slice(0, 200)
@@ -791,6 +1133,15 @@ async function main() {
           emit({ type: "system", subtype: "tool_use_end", tool_name: tname,
                  session_id: emittedSessionId ?? "" });
           log(`STDOUT system/tool_use_end tool=${tname}`);
+          toolCallCount++;
+
+          // Watchdog: every 5 tool calls without new text, edit the Discord message
+          // so the user knows the bot is still alive (not just hung silently).
+          const callsSinceText = toolCallCount - textSinceToolCount;
+          if (channelTarget && openClawEndpoint && callsSinceText > 0 && callsSinceText % 5 === 0) {
+            await showToolStatus(`_⏳ Still working… (${toolCallCount} tool calls so far)_`);
+            log(`INFO watchdog: updated Discord message at ${toolCallCount} tool calls`);
+          }
         }
       }
     }
@@ -804,10 +1155,19 @@ async function main() {
     if (message.type === "result" && message.subtype === "success") {
       stopToolKeepalive(); // belt-and-suspenders — clear any lingering timer
       log(`DIAG result_msg: ${JSON.stringify(message).slice(0, 300)}`);
+      const stopReason = message.stop_reason ?? message.stopReason ?? "";
+      if (stopReason === "max_turns") {
+        log(`WARN result: max_turns stop_reason — Claude may not have finished (no hard cap set; this came from the SDK itself)`);
+      }
       const curOutput = message.result ?? message.output ?? "";
-      if (!curOutput && capturedMsgText) {
-        outgoing = { ...message, result: capturedMsgText };
-        log(`INFO result-fix: set result.result="${capturedMsgText.slice(0, 60)}" to prevent empty_response fallback`);
+      if (capturedMsgText) {
+        // proxy.mjs already delivered the response to Discord via deliverToChannel /
+        // editChannelMessage.  Set result → NO_REPLY so OpenClaw does NOT re-deliver
+        // the same text as a second Discord message (which would double every response).
+        outgoing = { ...message, result: "NO_REPLY" };
+        log(`INFO result-fix: proxy delivered ${capturedMsgText.length} chars to Discord; result=NO_REPLY to suppress OpenClaw re-delivery`);
+      } else if (!curOutput) {
+        log(`WARN result: empty output and no captured Discord delivery (channel=${channelTarget || "none"})`);
       }
     }
     if (outgoing !== message && message.type === "assistant") {
@@ -853,12 +1213,68 @@ async function main() {
     }
   }
 
+  keepLooping = false; // for-await completed successfully — exit the while loop
+
+  } catch (err) {
+    // ── SDK error / compaction-retry handler ────────────────────────────────
+    const errMsg = err?.message ?? String(err);
+    log(`WARN query-loop threw: ${errMsg.slice(0, 300)}`);
+
+    // Classify: is this a compaction / stale-MCP-port error?
+    // Compaction errors look like: "404 ... /mcp" or "compaction failed" or
+    // "error 404 from openclaw".  We cast a reasonably wide net.
+    const isCompaction =
+      /compact/i.test(errMsg) ||
+      (/404/.test(errMsg) && /mcp|openclaw|session/i.test(errMsg));
+
+    // On the first compaction error in per-turn mode: clear the stale session
+    // and retry immediately with a fresh session so this turn completes
+    // successfully — the user gets their answer without having to repeat
+    // themselves.  keepLooping stays true so the while loop re-enters.
+    if (isCompaction && !isLiveSession && !retried) {
+      log(`WARN compaction: clearing session ${chatId ?? "(unknown)"}, retrying turn without resume`);
+      await deleteChatSession(chatId);
+      retried            = true;
+      emittedSessionId   = undefined;     // fresh session will have a new id
+      firstAssistantSeen = false;         // allow auto-ack to re-fire if needed
+      ackSent            = !!baseContent; // preserve ack state if Discord already got content
+      toolCallCount      = 0;
+      textSinceToolCount = 0;
+      // keepLooping stays true — the while loop will retry immediately
+    } else {
+      // Non-compaction error, already retried once, or live-session mode —
+      // emit a friendly result so OpenClaw/voice TTS's something clean.
+      queryError  = err;
+      keepLooping = false;
+      const friendlyMsg = isCompaction
+        ? "My conversation history was reset. Please repeat your question."
+        : "I ran into an error processing your request. Please try again.";
+      emit({
+        type:       "result",
+        subtype:    "success",
+        result:     friendlyMsg,
+        session_id: emittedSessionId ?? "",
+      });
+      log(`INFO query-error: emitted friendly result (isCompaction=${isCompaction}, retried=${retried})`);
+    }
+  }
+  } // end while (keepLooping)
+
+  // ── Post-loop cleanup (runs on both clean exit and error path) ────────────
   stopToolKeepalive(); // ensure timer is cleared if loop exits early
+  if (turnTimer) clearTimeout(turnTimer); // cancel timeout — turn finished cleanly
+  process.off("SIGTERM", onSigterm); // normal exit — no cutoff notice needed
 
   // Persist the session_id so the next per-turn message for this chat
   // can resume it (self-managed continuity, bypassing openclaw's broken
   // sessionIdFields tracking).
-  if (!isLiveSession && chatId && emittedSessionId) {
+  //   - Clean exit:          saves current session
+  //   - Compaction + retry:  saves the NEW session from the retry (emittedSessionId
+  //                          was reset in the retry setup, then re-captured from the
+  //                          fresh system/init event)
+  //   - Unrecoverable error: queryError is set, so we skip — session was deleted
+  //                          (compaction) or may be in an unknown state
+  if (!isLiveSession && chatId && emittedSessionId && !queryError) {
     await saveChatSession(chatId, emittedSessionId);
   }
 
