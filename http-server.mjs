@@ -513,7 +513,7 @@ const server = createServer(async (req, res) => {
     const reqId      = `chatcmpl-${Date.now()}`;
     const created    = Math.floor(Date.now() / 1000);
 
-    log(`DIAG body: model=${body.model} msgs=${body.messages?.length ?? 0} stream=${body.stream === true ? "true" : "false"} user=${body.user ?? "(unset)"}`);
+    log(`DIAG body: model=${body.model} msgs=${body.messages?.length ?? 0} stream=${wantStream} user=${body.user ?? "(unset)"}`);
 
 
 
