@@ -985,6 +985,8 @@ async function main() {
         log("INFO sigterm: edited active message with cutoff notice");
       }
     } catch { /* best-effort */ }
+    emit({ type: "result", subtype: "success", result: "NO_REPLY", session_id: emittedSessionId ?? "" });
+    log("INFO sigterm: emitted synthetic NO_REPLY result to suppress OpenClaw fallback delivery");
     process.exit(0);
   };
   process.once("SIGTERM", onSigterm);
@@ -1259,6 +1261,13 @@ async function main() {
     }
   }
   } // end while (keepLooping)
+
+  // Emit synthetic NO_REPLY result on turn-timeout — without this, OpenClaw
+  // receives EOF with no result event and dumps all raw JSONL to Discord.
+  if (turnTimedOut) {
+    emit({ type: "result", subtype: "success", result: "NO_REPLY", session_id: emittedSessionId ?? "" });
+    log("INFO turn-timeout: emitted synthetic NO_REPLY result to suppress OpenClaw fallback delivery");
+  }
 
   // ── Post-loop cleanup (runs on both clean exit and error path) ────────────
   stopToolKeepalive(); // ensure timer is cleared if loop exits early
