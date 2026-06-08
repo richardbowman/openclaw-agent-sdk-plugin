@@ -165,6 +165,51 @@ async function loadMcpServers() {
   }
 }
 
+// ── OpenClaw MCP discovery ────────────────────────────────────────────────────
+//
+// The OpenClaw MCP server runs on a port that changes every restart.
+// proxy.mjs writes the current URL to a stable file (openclaw-mcp.json)
+// on every CLI session start.  We read from that file and cache it.
+//
+// Cache: kept until a connection error indicates the port is stale (e.g. after
+// a restart).  On error the cache is cleared so the next request re-reads.
+// If the file doesn't exist yet (no CLI session since last restart), we skip
+// the openclaw server silently and fall back to HA-only tools — no crash.
+
+const OC_MCP_FILE = "/config/claude-sdk-proxy/openclaw-mcp.json";
+
+let _ocMcp = null;  // { url, headers } | null
+
+async function discoverOpenClawMcp() {
+  if (_ocMcp) return _ocMcp;
+  try {
+    const raw = JSON.parse(await readFile(OC_MCP_FILE, "utf8"));
+    if (!raw?.url) { log("WARN openclaw-mcp: no url in openclaw-mcp.json"); return null; }
+
+    // Quick liveness check — ECONNREFUSED is instant, 2 s covers slow starts.
+    const alive = await fetch(raw.url, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", ...(raw.headers ?? {}) },
+      body:    JSON.stringify({ jsonrpc: "2.0", id: 0, method: "tools/list" }),
+      signal:  AbortSignal.timeout(2_000),
+    }).then(r => r.ok).catch(() => false);
+
+    if (!alive) {
+      log(`WARN openclaw-mcp: ${raw.url} not responding (stale after restart?) — openclaw tools unavailable`);
+      return null;  // don't cache so next request retries after proxy.mjs refreshes the file
+    }
+
+    _ocMcp = { url: raw.url, headers: raw.headers ?? {} };
+    log(`INFO openclaw-mcp: using ${raw.url}`);
+    return _ocMcp;
+  } catch (err) {
+    if (err?.code !== "ENOENT") {
+      log(`WARN openclaw-mcp: ${err?.message ?? String(err)}`);
+    }
+    return null;
+  }
+}
+
 // ── Session store ─────────────────────────────────────────────────────────────
 
 async function loadChatSession(chatId) {
@@ -337,7 +382,15 @@ async function runChatCompletion(body, onChunk) {
     ...(tokenExpired                  && { CLAUDE_CONFIG_DIR: "/config/.claude" }),
   };
 
-  const mcpServers   = await loadMcpServers();
+  const staticMcp  = await loadMcpServers();
+  const ocMcp      = await discoverOpenClawMcp();
+  const mcpServers = {
+    ...staticMcp,
+    ...(ocMcp
+      ? { openclaw: { type: "http", url: ocMcp.url,
+                      ...(Object.keys(ocMcp.headers).length ? { headers: ocMcp.headers } : {}) } }
+      : {}),
+  };
   const mcpNames     = Object.keys(mcpServers);
   const allowedTools = mcpNames.length > 0
     ? mcpNames.map(n => `mcp__${n}__*`)
@@ -415,6 +468,14 @@ async function runChatCompletion(body, onChunk) {
     } catch (err) {
       const errMsg = err?.message ?? String(err);
       log(`WARN query threw: ${errMsg.slice(0, 300)}`);
+
+      // If the openclaw MCP server is unreachable (stale port after restart),
+      // clear the in-memory cache so the next request re-reads the stable file
+      // (which proxy.mjs refreshes on every CLI session start).
+      if (_ocMcp && /ECONNREFUSED|ECONNRESET|connect.*failed/i.test(errMsg)) {
+        log("WARN openclaw-mcp: connection error — clearing cached URL for re-discovery");
+        _ocMcp = null;
+      }
 
       const isCompaction =
         /compact/i.test(errMsg) ||

@@ -405,10 +405,17 @@ function enrichAssistantMessage(message) {
 // This lets us intercept Claude's text output and route it to Discord ourselves,
 // keeping the model completely unaware of channels, tool names, or delivery.
 
+// Stable file where the discovered OpenClaw MCP URL is persisted so
+// http-server.mjs can read it without needing /tmp temp files.
+// Updated on every CLI session start (fire-and-forget, never throws).
+const OC_MCP_STABLE_FILE = "/config/claude-sdk-proxy/openclaw-mcp.json";
+
 /**
  * Parse the MCP config file written by OpenClaw and return { url, headers }
  * with ${ENV_VAR} placeholders expanded from process.env.
  * Returns null if absent, not HTTP-based, or unreadable.
+ * Side-effect: writes { url, headers } to OC_MCP_STABLE_FILE so the HTTP
+ * server can read the current port without scanning ephemeral /tmp files.
  */
 async function loadOpenClawEndpoint(cfgPath) {
   if (!cfgPath) return null;
@@ -422,6 +429,12 @@ async function loadOpenClawEndpoint(cfgPath) {
     const headers = {};
     for (const [k, v] of Object.entries(server.headers ?? {})) headers[k] = expand(v);
     log(`INFO openclaw-endpoint: ${url}`);
+
+    // Persist the URL for http-server.mjs (fire-and-forget — never delays the turn).
+    writeFile(OC_MCP_STABLE_FILE, JSON.stringify({ url, headers }, null, 2) + "\n", "utf8")
+      .then(() => log(`INFO openclaw-endpoint: persisted to ${OC_MCP_STABLE_FILE}`))
+      .catch((e) => log(`WARN openclaw-endpoint: could not persist: ${e?.message ?? String(e)}`));
+
     return { url, headers };
   } catch (err) {
     log(`WARN loadOpenClawEndpoint: ${err?.message ?? String(err)}`);
